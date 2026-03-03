@@ -35,11 +35,15 @@ Sweep protocol:
     Arduino sends "SWEEP_DONE"                  when back at centre
 
 Arduino → Pi:
-    READY           sent on boot (every second until ACK received)
-    DONE:<cm>       drive segment complete; encoder distance covered
-    AT:h,t          current horizontal and tilt angles during a sweep
-    SWEEP_DONE      sweep complete, rover back at heading 0
-    DIST:<cm>       response to Query command (distance since last query)
+    READY              sent on boot (every second until ACK received)
+    DONE:<cm>,<ratio>  drive segment complete; encoder distance + slip ratio
+    CLIFF:<cm>         ground lost mid-drive (motors already stopped);
+                       cm = partial encoder distance covered before stop.
+                       No DONE is sent for that segment.
+                       Also sent at 1 Hz while idle if ground is lost.
+    AT:h,t             current horizontal and tilt angles during a sweep
+    SWEEP_DONE         sweep complete, rover back at heading 0
+    DIST:<cm>          response to Query command (distance since last query)
 """
 
 import math
@@ -52,6 +56,12 @@ import smbus2  # type: ignore
 sys.path.append("Control/Nav")
 from heightmap import Heightmap  # type: ignore
 from astar import AStar          # type: ignore
+
+
+class CliffDetected(Exception):
+    """Raised when the Arduino reports a cliff mid-drive."""
+    def __init__(self, partial_cm: float) -> None:
+        self.partial_cm = partial_cm  # encoder distance covered before stop
 
 # ── Serial ────────────────────────────────────────────────────────────────────
 SERIAL_PORT       = "/dev/ttyUSB0"
@@ -80,6 +90,10 @@ MAG_ADDR  = 0x0C
 _MAG_CNTL2 = 0x31  # control 2 — measurement mode
 _MAG_ST1   = 0x10  # status 1  — DRDY bit 0
 _MAG_HXL   = 0x11  # first measurement byte (little-endian X/Y/Z + ST2)
+
+# ── Cliff detection ───────────────────────────────────────────────────────────
+CLIFF_DROP_CM      = 5     # cliff cell is marked this many cm below current cell
+PITCH_UP_THRESHOLD = 10.0  # degrees — above this, cliff alert is a normal slope
 
 # ── Map configuration ─────────────────────────────────────────────────────────
 MAP_WIDTH_M  = 3.0   # physical width  in metres
@@ -217,6 +231,8 @@ def drive_segment(
             actual_cm   = float(parts[0])
             error_ratio = float(parts[1]) if len(parts) > 1 else 1.0
             return actual_cm, error_ratio
+        if line.startswith("CLIFF:"):
+            raise CliffDetected(float(line[6:]))
     return 0.0, 0.0
 
 
@@ -354,6 +370,44 @@ def sensor_sweep(
             ser.write(b"NEXT\n")
 
 
+# ── Cliff response ────────────────────────────────────────────────────────────
+def handle_cliff(
+    ser: serial.Serial,
+    bus: smbus2.SMBus,
+    heightmap: Heightmap,
+    planner: AStar,
+    x: int,
+    y: int,
+    heading_deg: float,
+    initial_heading_deg: float,
+) -> list[tuple[int, int]] | None:
+    """
+    Called when a CliffDetected exception propagates up from move_rover.
+
+    1. Check IMU pitch — if the rover is pitched upward the ultrasonic is
+       simply looking past the slope, not a real drop; return None to retry.
+    2. Mark the cell directly ahead of the rover as a cliff in the heightmap
+       (height = CLIFF_MARK_HEIGHT, well below current ground so A* avoids it).
+    3. Perform a full 360° LIDAR sweep to refresh the map around the rover.
+    4. Return a fresh path from the planner, or None if no path exists.
+    """
+    pitch = read_pitch(bus)
+    if pitch > PITCH_UP_THRESHOLD:
+        return None  # rover is climbing — expected ground loss, not a cliff
+
+    # Mark cell immediately ahead as a cliff
+    rel_rad    = math.radians(heading_deg - initial_heading_deg)
+    ahead_row  = x + round(math.cos(rel_rad))
+    ahead_col  = y + round(math.sin(rel_rad))
+    if 0 <= ahead_row < heightmap.rows and 0 <= ahead_col < heightmap.cols:
+        heightmap.heights[ahead_row][ahead_col] = heightmap.heights[x][y] - CLIFF_DROP_CM
+
+    # Full 360° sweep to update surroundings before replanning
+    sensor_sweep(ser, bus, heightmap, x, y, range_deg=360.0, step_ms=200.0)
+
+    return None  # caller should call planner.find_path() with the updated map
+
+
 # ── Boot ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     ser = init_serial()
@@ -380,7 +434,17 @@ def main() -> None:
         # TODO: sensor_sweep(ser, bus, heightmap, x, y, range_deg=90.0, step_ms=200.0)
         # TODO: determine goal
         # TODO: path = planner.find_path((x, y), goal)
-        # TODO: convert path steps to send_command() calls
+
+        # TODO: replace with real path step iteration
+        # Example movement with cliff handling:
+        # try:
+        #     moved = move_rover(ser, UP, step_cm)
+        #     x, y = update_position(x, y, moved, heading, initial_heading)
+        # except CliffDetected as e:
+        #     x, y = update_position(x, y, e.partial_cm, heading, initial_heading)
+        #     heading = read_heading(bus)
+        #     handle_cliff(ser, bus, heightmap, planner, x, y, heading, initial_heading)
+        #     path = planner.find_path((x, y), goal)  # replan with updated map
         pass
 
 

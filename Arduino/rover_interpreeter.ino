@@ -36,6 +36,12 @@
  *   Pi sends      (3, 0, 0, 0)
  *   Arduino sends "DIST:<cm>"  — distance since last query, then resets counter
  *
+ * Cliff detection (Arduino → Pi, unsolicited):
+ *   Arduino sends "CLIFF:<dist_cm>"  when the downward ultrasonic loses the
+ *   ground mid-drive.  Motors are already stopped when this is sent.
+ *   dist_cm is the partial encoder distance covered before the stop.
+ *   No DONE is sent for that segment.
+ *
  * Handshake:
  *   Arduino sends  "READY"  every second until Pi replies "ACK"
  */
@@ -50,6 +56,10 @@
 #define PIN_IN4  9
 
 #define PIN_TILT 11  // Camera tilt servo
+
+// Downward-facing ultrasonic (HC-SR04) — cliff / drop-off detection
+#define PIN_ULTRA_DOWN_TRIG A0
+#define PIN_ULTRA_DOWN_ECHO A1
 
 // Encoder (SparkFun 64 P/R quadrature) — hardware interrupt pins
 #define ENCODER_A 2  // interrupt pin — channel A
@@ -81,6 +91,12 @@
 
 // Distance-controlled driving
 #define MOTOR_TIMEOUT_MS 30000UL  // 30 s hard timeout per drive segment
+
+// Cliff detection — downward ultrasonic at 45°
+// On flat ground the sensor reads ~sensor_height / sin(45°).
+// If it suddenly reads above CLIFF_THRESHOLD_CM, the ground has dropped away.
+#define CLIFF_THRESHOLD_CM    40.0f   // calibrate for your mounting height
+#define CLIFF_ALERT_INTERVAL  1000UL  // ms between idle CLIFF alerts
 
 // Tilt angles visited at each horizontal position (up then back down)
 const int TILT_ANGLES[]  = {60, 75, 90, 105, 120};
@@ -135,6 +151,18 @@ void setMotor(int en, int in1, int in2, int pwm, bool forward) {
 void stopMotors() {
     analogWrite(PIN_ENA, 0);
     analogWrite(PIN_ENB, 0);
+}
+
+// ── Ultrasonic / cliff detection ──────────────────────────────────────────────
+// Returns distance in cm; 999.0 if nothing detected within timeout.
+float readUltrasonicDown() {
+    digitalWrite(PIN_ULTRA_DOWN_TRIG, LOW);
+    delayMicroseconds(2);
+    digitalWrite(PIN_ULTRA_DOWN_TRIG, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(PIN_ULTRA_DOWN_TRIG, LOW);
+    long us = pulseIn(PIN_ULTRA_DOWN_ECHO, HIGH, 30000UL);  // 30 ms → ~5 m max
+    return (us == 0) ? 999.0f : us * 0.01715f;              // µs → cm
 }
 
 // Turn left (counter-clockwise) for a given number of degrees
@@ -257,26 +285,40 @@ void handleMotor(int direction, float distanceCm, float speed) {
 
     long targetCounts = (long)(distanceCm / DIST_PER_REV_CM * COUNTS_PER_REV);
     unsigned long deadline = millis() + MOTOR_TIMEOUT_MS;
+    bool cliffDetected = false;
 
     while (millis() < deadline) {
         noInterrupts();
         long travelled = abs(encoderCount - startCount);
         interrupts();
         if (travelled >= targetCounts) break;
+
+        // Check downward ultrasonic — abort if ground disappears
+        if (readUltrasonicDown() > CLIFF_THRESHOLD_CM) {
+            cliffDetected = true;
+            break;
+        }
     }
 
     stopMotors();
 
-    // Report actual distance and slip ratio to Pi
     noInterrupts();
     long actualCounts = abs(encoderCount - startCount);
     interrupts();
 
-    float actualCm   = (float)actualCounts / COUNTS_PER_REV * DIST_PER_REV_CM;
+    float actualCm = (float)actualCounts / COUNTS_PER_REV * DIST_PER_REV_CM;
+
+    if (cliffDetected) {
+        // Send partial distance covered; Pi will handle cliff response
+        Serial.print("CLIFF:");
+        Serial.println(actualCm);
+        return;
+    }
+
+    // Normal completion — report distance and slip ratio
     // error > 1.0 → wheels spun more than expected (slipping)
     // error < 1.0 → fewer counts than expected (stalled or very slow)
     float errorRatio = (targetCounts > 0) ? (float)actualCounts / (float)targetCounts : 1.0f;
-
     Serial.print("DONE:");
     Serial.print(actualCm);
     Serial.print(",");
@@ -309,10 +351,16 @@ void dispatch(const Command& cmd) {
 }
 
 // ── Setup / Loop ──────────────────────────────────────────────────────────────
+unsigned long lastCliffAlert = 0;  // rate-limit idle cliff messages
+
 void setup() {
     pinMode(PIN_ENA, OUTPUT); pinMode(PIN_IN1, OUTPUT); pinMode(PIN_IN2, OUTPUT);
     pinMode(PIN_ENB, OUTPUT); pinMode(PIN_IN3, OUTPUT); pinMode(PIN_IN4, OUTPUT);
     stopMotors();
+
+    // Ultrasonic
+    pinMode(PIN_ULTRA_DOWN_TRIG, OUTPUT);
+    pinMode(PIN_ULTRA_DOWN_ECHO, INPUT);
 
     // Encoder
     pinMode(ENCODER_A, INPUT_PULLUP);
@@ -339,6 +387,17 @@ void setup() {
 }
 
 void loop() {
+    // Idle cliff check — rate-limited so Pi isn't flooded while stationary
+    if (millis() - lastCliffAlert >= CLIFF_ALERT_INTERVAL) {
+        float downDist = readUltrasonicDown();
+        if (downDist > CLIFF_THRESHOLD_CM) {
+            stopMotors();
+            Serial.print("CLIFF:");
+            Serial.println(downDist);
+            lastCliffAlert = millis();
+        }
+    }
+
     if (Serial.available()) {
         String raw = Serial.readStringUntil('\n');
         Command cmd;

@@ -9,10 +9,20 @@
  * Direction: left (0), right (1), up (2), down (3)
  *            — ignored for Sweep and Query
  * Amount:    Servo: target angle as 0.0–1.0 (→ 0–180°)
- *            Motor: unused
+ *            Motor: target distance in cm  (0 = continuous, no distance control)
  *            Sweep: total angular range in degrees (e.g. 90.0)
  * Speed:     Motor: PWM duty cycle 0.0–1.0 (→ 0–255)
  *            Sweep: time between steps in ms (e.g. 200.0)
+ *
+ * Motor distance protocol:
+ *   Pi sends      (1, <dir>, <distance_cm>, <speed>)
+ *   Arduino drives until encoder reaches target (or timeout), then stops
+ *   Arduino sends "DONE:<actual_cm>,<error_ratio>"
+ *     actual_cm   — encoder-measured distance covered
+ *     error_ratio — actual_counts / target_counts
+ *                   > 1.0 : wheels spun more than expected (slipping)
+ *                   < 1.0 : fewer counts than expected (stalled / very slow)
+ *   (If distance_cm == 0, motors run continuously; no DONE is sent)
  *
  * Sweep protocol:
  *   Pi sends      (2, 0, <range_deg>, <step_ms>)
@@ -68,6 +78,9 @@
 #define SWEEP_STEP_DEG   5     // horizontal angular resolution per step (degrees)
 #define SWEEP_TURN_PWM   150   // motor PWM used during sweep rotation
 #define MS_PER_DEGREE    12    // ms of motor runtime per degree — calibrate!
+
+// Distance-controlled driving
+#define MOTOR_TIMEOUT_MS 30000UL  // 30 s hard timeout per drive segment
 
 // Tilt angles visited at each horizontal position (up then back down)
 const int TILT_ANGLES[]  = {60, 75, 90, 105, 120};
@@ -207,31 +220,67 @@ void handleServo(int direction, float amount, float /*speed*/) {
     }
 }
 
-void handleMotor(int direction, float /*amount*/, float speed) {
+void handleMotor(int direction, float distanceCm, float speed) {
     int pwm = (int)(speed * 255.0f);
     pwm = constrain(pwm, 0, 255);
 
+    bool forward;
     switch (direction) {
-        case DIR_UP:
-            setMotor(PIN_ENA, PIN_IN1, PIN_IN2, pwm, true);
-            setMotor(PIN_ENB, PIN_IN3, PIN_IN4, pwm, true);
-            break;
-        case DIR_DOWN:
-            setMotor(PIN_ENA, PIN_IN1, PIN_IN2, pwm, false);
-            setMotor(PIN_ENB, PIN_IN3, PIN_IN4, pwm, false);
-            break;
+        case DIR_UP:    forward = true;  break;
+        case DIR_DOWN:  forward = false; break;
         case DIR_LEFT:
             setMotor(PIN_ENA, PIN_IN1, PIN_IN2, pwm, false);
             setMotor(PIN_ENB, PIN_IN3, PIN_IN4, pwm, true);
-            break;
+            return;
         case DIR_RIGHT:
             setMotor(PIN_ENA, PIN_IN1, PIN_IN2, pwm, true);
             setMotor(PIN_ENB, PIN_IN3, PIN_IN4, pwm, false);
-            break;
+            return;
         default:
             stopMotors();
-            break;
+            return;
     }
+
+    // Start driving
+    setMotor(PIN_ENA, PIN_IN1, PIN_IN2, pwm, forward);
+    setMotor(PIN_ENB, PIN_IN3, PIN_IN4, pwm, forward);
+
+    if (distanceCm <= 0.0f) {
+        // Continuous mode — caller is responsible for stopping
+        return;
+    }
+
+    // Distance-controlled mode: snapshot encoder, drive until target, then stop
+    noInterrupts();
+    long startCount = encoderCount;
+    interrupts();
+
+    long targetCounts = (long)(distanceCm / DIST_PER_REV_CM * COUNTS_PER_REV);
+    unsigned long deadline = millis() + MOTOR_TIMEOUT_MS;
+
+    while (millis() < deadline) {
+        noInterrupts();
+        long travelled = abs(encoderCount - startCount);
+        interrupts();
+        if (travelled >= targetCounts) break;
+    }
+
+    stopMotors();
+
+    // Report actual distance and slip ratio to Pi
+    noInterrupts();
+    long actualCounts = abs(encoderCount - startCount);
+    interrupts();
+
+    float actualCm   = (float)actualCounts / COUNTS_PER_REV * DIST_PER_REV_CM;
+    // error > 1.0 → wheels spun more than expected (slipping)
+    // error < 1.0 → fewer counts than expected (stalled or very slow)
+    float errorRatio = (targetCounts > 0) ? (float)actualCounts / (float)targetCounts : 1.0f;
+
+    Serial.print("DONE:");
+    Serial.print(actualCm);
+    Serial.print(",");
+    Serial.println(errorRatio, 4);
 }
 
 void handleSweep(float amount, float speed) {

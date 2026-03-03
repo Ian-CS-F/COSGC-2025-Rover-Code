@@ -11,14 +11,22 @@ Direction:
 
 Amount:
     Servo: target angle as 0.0–1.0 (→ 0–180°)
-    Motor: unused
+    Motor: target distance in cm (0 = continuous, no distance control)
     Sweep: total horizontal range in degrees (e.g. 90.0)
 
 Speed:
     Motor: PWM duty cycle 0.0–1.0 (→ 0–255)
     Sweep: time between tilt steps in ms (e.g. 200.0)
 
-Example: (1, 0, 0.5, 0.8) → Motor, left, 50% amount, 80% speed
+Motor distance protocol:
+    Pi sends      (1, <dir>, <distance_cm>, <speed>)
+    Arduino drives until encoder reaches target, then stops
+    Arduino sends "DONE:<actual_cm>,<error_ratio>"
+      actual_cm   — encoder-measured distance covered
+      error_ratio — actual_counts / target_counts
+                    > 1.0 : wheels spun more than expected (slipping)
+                    < 1.0 : fewer counts than expected (stalled / very slow)
+    (amount == 0 → continuous drive; no DONE sent)
 
 Sweep protocol:
     Pi sends      (2, 0, <range_deg>, <step_ms>)
@@ -27,9 +35,11 @@ Sweep protocol:
     Arduino sends "SWEEP_DONE"                  when back at centre
 
 Arduino → Pi:
-    READY       sent on boot (every second until ACK received)
-    AT:h,t      current horizontal and tilt angles during a sweep
-    SWEEP_DONE  sweep complete, rover back at heading 0
+    READY           sent on boot (every second until ACK received)
+    DONE:<cm>       drive segment complete; encoder distance covered
+    AT:h,t          current horizontal and tilt angles during a sweep
+    SWEEP_DONE      sweep complete, rover back at heading 0
+    DIST:<cm>       response to Query command (distance since last query)
 """
 
 import math
@@ -175,6 +185,67 @@ def read_lidar(bus: smbus2.SMBus) -> float:
     high = bus.read_byte_data(LIDAR_ADDR, 0x0f)
     low  = bus.read_byte_data(LIDAR_ADDR, 0x10)
     return ((high << 8) | low) / 100.0            # cm → m
+
+
+# ── Motor PID constants ───────────────────────────────────────────────────────
+MOTOR_DONE_TIMEOUT  = 30.0  # seconds to wait for DONE per segment
+SLIP_THRESHOLD      = 0.15  # error deviation that triggers speed update
+MIN_DRIVE_SPEED     = 0.3   # lowest PWM fraction allowed (avoid motor stall)
+DEFAULT_DRIVE_SPEED = 0.7   # starting speed before any learning
+
+_drive_speed: float = DEFAULT_DRIVE_SPEED  # learned optimal — persists across calls
+
+
+def drive_segment(
+    ser: serial.Serial, direction: int, distance_cm: float, speed: float
+) -> tuple[float, float]:
+    """
+    Send one distance-controlled motor command and wait for DONE.
+
+    Returns (actual_cm, error_ratio) where:
+        actual_cm   — encoder-measured distance covered
+        error_ratio — actual_counts / target_counts
+                      > 1.0 : slipping (wheels spun more than expected)
+                      < 1.0 : stalled or very slow
+    """
+    send_command(ser, MOTOR, direction, distance_cm, speed)
+    deadline = time.monotonic() + MOTOR_DONE_TIMEOUT
+    while time.monotonic() < deadline:
+        line = ser.readline().decode(errors="replace").strip()
+        if line.startswith("DONE:"):
+            parts = line[5:].split(",")
+            actual_cm   = float(parts[0])
+            error_ratio = float(parts[1]) if len(parts) > 1 else 1.0
+            return actual_cm, error_ratio
+    return 0.0, 0.0
+
+
+def move_rover(ser: serial.Serial, direction: int, total_cm: float) -> float:
+    """
+    Drive total_cm in direction with slip-compensating closed-loop control.
+
+    Uses and updates the module-level _drive_speed so the learned optimal
+    speed carries over into every subsequent call.
+
+    Returns the total encoder-measured distance covered (cm).
+    """
+    global _drive_speed
+    remaining = total_cm
+    travelled = 0.0
+
+    while remaining > 1.0:
+        segment = remaining
+        actual, error_ratio = drive_segment(ser, direction, segment, _drive_speed)
+        travelled += actual
+        remaining -= actual
+
+        # Update the persistent speed whenever error deviates past threshold.
+        # error_ratio > 1 → slipping (reduce speed for better grip)
+        # error_ratio < 1 → stalling (reduce speed to avoid motor strain)
+        if abs(error_ratio - 1.0) > SLIP_THRESHOLD:
+            _drive_speed = max(MIN_DRIVE_SPEED, _drive_speed / error_ratio)
+
+    return travelled
 
 
 # ── Odometry ──────────────────────────────────────────────────────────────────

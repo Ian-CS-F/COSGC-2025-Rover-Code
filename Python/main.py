@@ -108,6 +108,12 @@ RESOLUTION_M = 0.05  # metres per cell
 COLS = int(MAP_WIDTH_M  / RESOLUTION_M)
 ROWS = int(MAP_HEIGHT_M / RESOLUTION_M)
 
+# ── Navigation constants ──────────────────────────────────────────────────────
+GOAL_TOLERANCE_CELLS  = 3     # Euclidean cell distance that counts as "arrived"
+SWEEP_EVERY_N_STEPS   = 5     # resweep and replan after this many path steps
+STRAIGHT_SEGMENT_CM   = 50.0  # segment length when driving straight toward goal
+STRAIGHT_MAX_SEGMENTS = 20    # maximum straight segments before giving up
+
 
 # ── Serial init ───────────────────────────────────────────────────────────────
 def init_serial() -> serial.Serial:
@@ -236,6 +242,11 @@ SLIP_THRESHOLD      = 0.15  # error deviation that triggers speed update
 MIN_DRIVE_SPEED     = 0.3   # lowest PWM fraction allowed (avoid motor stall)
 DEFAULT_DRIVE_SPEED = 0.7   # starting speed before any learning
 
+# ── Turn constants ────────────────────────────────────────────────────────────
+TURN_SPEED         = 0.5   # PWM duty cycle for in-place tank turns
+TURN_TOLERANCE_DEG = 5.0   # acceptable heading error before stopping turn
+TURN_TIMEOUT       = 15.0  # max seconds to complete a turn
+
 _drive_speed: float = DEFAULT_DRIVE_SPEED  # learned optimal — persists across calls
 
 
@@ -291,6 +302,41 @@ def move_rover(ser: serial.Serial, direction: int, total_cm: float) -> float:
             _drive_speed = max(MIN_DRIVE_SPEED, _drive_speed / error_ratio)
 
     return travelled
+
+
+def turn_to_heading(ser: serial.Serial, bus: smbus2.SMBus, target_deg: float) -> None:
+    """
+    Rotate the rover in-place until it faces target_deg (±TURN_TOLERANCE_DEG).
+
+    Uses a tank turn: one motor drives forward, the other backward (Arduino
+    LEFT/RIGHT commands). IMU heading is polled to determine when to stop.
+    Direction is reversed automatically if the rover overshoots.
+    """
+    current = read_heading(bus)
+    diff = ((target_deg - current) + 180.0) % 360.0 - 180.0  # range −180..+180
+
+    if abs(diff) < TURN_TOLERANCE_DEG:
+        return  # already facing the right way
+
+    direction = RIGHT if diff > 0.0 else LEFT
+    send_command(ser, MOTOR, direction, 0.0, TURN_SPEED)
+
+    deadline = time.monotonic() + TURN_TIMEOUT
+    while time.monotonic() < deadline:
+        current = read_heading(bus)
+        remaining = ((target_deg - current) + 180.0) % 360.0 - 180.0
+
+        if abs(remaining) < TURN_TOLERANCE_DEG:
+            break
+
+        # Reverse direction if we overshot (sign of remaining flipped)
+        if (diff > 0.0) != (remaining > 0.0):
+            diff = remaining
+            direction = RIGHT if diff > 0.0 else LEFT
+            send_command(ser, MOTOR, direction, 0.0, TURN_SPEED)
+
+    # Stop both motors (speed = 0 with any direction stops the PWM)
+    send_command(ser, MOTOR, UP, 0.0, 0.0)
 
 
 # ── Odometry ──────────────────────────────────────────────────────────────────
@@ -437,6 +483,141 @@ def handle_cliff(
     return None  # caller should call planner.find_path() with the updated map
 
 
+# ── Path following ────────────────────────────────────────────────────────────
+def follow_path(
+    ser: serial.Serial,
+    bus: smbus2.SMBus,
+    heightmap: Heightmap,
+    planner: AStar,
+    path: list[tuple[int, int]],
+    x: int,
+    y: int,
+    initial_heading: float,
+    goal: tuple[int, int],
+) -> tuple[int, int]:
+    """
+    Execute an A* path cell-by-cell using IMU-guided turns and encoder drives.
+
+    For each step:
+      1. Compute the compass heading from the current cell to the next.
+      2. Call turn_to_heading() — one motor forward, one backward (tank turn).
+      3. Call move_rover() to drive the cell-to-cell distance.
+      4. Update dead-reckoned position.
+
+    Every SWEEP_EVERY_N_STEPS steps a 90° sweep is performed and the path
+    is replanned with fresh map data.  CliffDetected exceptions trigger a
+    360° sweep, heightmap update, and full replan before continuing.
+
+    Returns the rover's (x, y) grid position when the path is exhausted or
+    the goal is reached.
+    """
+    steps_since_sweep = 0
+
+    while len(path) > 1:
+        check_and_update_flip(ser, bus)
+
+        # Periodic resweep + replan to incorporate new surroundings
+        if steps_since_sweep >= SWEEP_EVERY_N_STEPS:
+            sensor_sweep(ser, bus, heightmap, x, y, range_deg=90.0, step_ms=200.0)
+            path = planner.find_path((x, y), goal) or []
+            steps_since_sweep = 0
+            if not path:
+                print("No path after periodic sweep — stopping")
+                break
+
+        next_cell = path[1]
+        dr = next_cell[0] - x
+        dc = next_cell[1] - y
+
+        # Convert grid direction (dr, dc) to compass heading.
+        # Consistent with update_position: d_row = cos(rel), d_col = sin(rel).
+        rel_deg = math.degrees(math.atan2(dc, dr))
+        target_heading = (initial_heading + rel_deg) % 360.0
+        dist_cm = math.hypot(dr, dc) * RESOLUTION_M * 100.0
+
+        # Align rover heading, then drive
+        turn_to_heading(ser, bus, target_heading)
+        heading = read_heading(bus)
+
+        try:
+            moved_cm = move_rover(ser, UP, dist_cm)
+            x, y = update_position(x, y, moved_cm, heading, initial_heading)
+            path = path[1:]
+            steps_since_sweep += 1
+
+        except CliffDetected as e:
+            x, y = update_position(x, y, e.partial_cm, heading, initial_heading)
+            heading = read_heading(bus)
+            handle_cliff(ser, bus, heightmap, planner, x, y, heading, initial_heading)
+            path = planner.find_path((x, y), goal) or []
+            steps_since_sweep = 0
+            if not path:
+                print("No path after cliff avoidance — stopping")
+                break
+
+    return x, y
+
+
+# ── Straight-line fallback ────────────────────────────────────────────────────
+def drive_straight_toward_goal(
+    ser: serial.Serial,
+    bus: smbus2.SMBus,
+    heightmap: Heightmap,
+    planner: AStar,
+    x: int,
+    y: int,
+    initial_heading: float,
+    goal: tuple[int, int],
+) -> tuple[int, int, list[tuple[int, int]] | None]:
+    """
+    Used when A* cannot find a route to goal.
+
+    Finds the nearest navigable cell along the heading toward goal, turns to
+    face it, then drives in STRAIGHT_SEGMENT_CM increments.  After each
+    segment a 90° sweep is performed and A* is retried.  Returns as soon as
+    a valid path is found, or after STRAIGHT_MAX_SEGMENTS without one.
+
+    Returns (x, y, path) where path is non-None when a route to goal is found.
+    """
+    dr_goal = goal[0] - x
+    dc_goal = goal[1] - y
+    if math.hypot(dr_goal, dc_goal) == 0:
+        return x, y, planner.find_path((x, y), goal)
+
+    # Compass heading pointing toward the overall goal (inverse of update_position)
+    rel_deg = math.degrees(math.atan2(dc_goal, dr_goal))
+    target_heading = (initial_heading + rel_deg) % 360.0
+
+    print(f"Driving straight toward goal: heading {target_heading:.1f}°")
+    turn_to_heading(ser, bus, target_heading)
+
+    for seg in range(STRAIGHT_MAX_SEGMENTS):
+        check_and_update_flip(ser, bus)
+        heading = read_heading(bus)
+
+        try:
+            moved_cm = move_rover(ser, UP, STRAIGHT_SEGMENT_CM)
+        except CliffDetected as e:
+            # Cliff mid-segment — update position, handle it, then return
+            # whatever path we can find so the caller can decide next action.
+            x, y = update_position(x, y, e.partial_cm, heading, initial_heading)
+            heading = read_heading(bus)
+            handle_cliff(ser, bus, heightmap, planner, x, y, heading, initial_heading)
+            path = planner.find_path((x, y), goal)
+            return x, y, path
+
+        x, y = update_position(x, y, moved_cm, heading, initial_heading)
+
+        # Sweep and retry A* after each segment
+        sensor_sweep(ser, bus, heightmap, x, y, range_deg=90.0, step_ms=200.0)
+        path = planner.find_path((x, y), goal)
+        if path:
+            print(f"Path to goal found after {seg + 1} straight segment(s)")
+            return x, y, path
+
+    return x, y, None  # STRAIGHT_MAX_SEGMENTS exhausted without finding a path
+
+
 # ── Boot ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     ser = init_serial()
@@ -454,30 +635,49 @@ def main() -> None:
     # Starting grid position — middle bottom (rover travels forward/up the grid)
     x, y = ROWS - 1, COLS // 2
 
+    # Goal: middle of the far end of the course
+    goal = (0, COLS // 2)
+
+    # Initial forward sweep to build the map before planning
+    print("Initial sensor sweep…")
+    sensor_sweep(ser, bus, heightmap, x, y, range_deg=90.0, step_ms=200.0)
+
+    path = planner.find_path((x, y), goal)
+    if path is None:
+        print("No initial path to goal — driving straight toward goal…")
+        x, y, path = drive_straight_toward_goal(
+            ser, bus, heightmap, planner, x, y, initial_heading, goal
+        )
+        if path is None:
+            print("Could not reach goal — stopped")
+            return
+
+    print(f"Path found: {len(path)} cells  Goal: {goal}")
+
     while True:
-        # Detect flip; sends FLIP command to Arduino only on state change
         check_and_update_flip(ser, bus)
 
-        # Update position from encoder + IMU
-        dist_cm  = query_distance(ser)
-        heading  = read_heading(bus)   # already corrected for flip state
-        x, y     = update_position(x, y, dist_cm, heading, initial_heading)
+        x, y = follow_path(ser, bus, heightmap, planner, path, x, y, initial_heading, goal)
 
-        # TODO: sensor_sweep(ser, bus, heightmap, x, y, range_deg=90.0, step_ms=200.0)
-        # TODO: determine goal
-        # TODO: path = planner.find_path((x, y), goal)
+        if math.hypot(x - goal[0], y - goal[1]) <= GOAL_TOLERANCE_CELLS:
+            print(f"Goal reached at ({x}, {y})")
+            break
 
-        # TODO: replace with real path step iteration
-        # Example movement with cliff handling:
-        # try:
-        #     moved = move_rover(ser, UP, step_cm)
-        #     x, y = update_position(x, y, moved, heading, initial_heading)
-        # except CliffDetected as e:
-        #     x, y = update_position(x, y, e.partial_cm, heading, initial_heading)
-        #     heading = read_heading(bus)
-        #     handle_cliff(ser, bus, heightmap, planner, x, y, heading, initial_heading)
-        #     path = planner.find_path((x, y), goal)  # replan with updated map
-        pass
+        # Path exhausted without reaching goal — do a full sweep and replan
+        print("Path exhausted, doing 360° sweep and replanning…")
+        sensor_sweep(ser, bus, heightmap, x, y, range_deg=360.0, step_ms=200.0)
+        path = planner.find_path((x, y), goal)
+        if path is not None:
+            print(f"Replanned: {len(path)} cells remaining")
+            continue
+
+        # Still no path after full sweep — drive straight toward goal
+        x, y, path = drive_straight_toward_goal(
+            ser, bus, heightmap, planner, x, y, initial_heading, goal
+        )
+        if path is None:
+            print("No path found after straight drive — stopped")
+            break
 
 
 if __name__ == "__main__":

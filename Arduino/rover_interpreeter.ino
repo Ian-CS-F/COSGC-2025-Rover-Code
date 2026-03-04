@@ -5,7 +5,7 @@
  * Communication Schema  (Pi → Arduino)
  * (System, Direction, Amount, Speed)
  *
- * System:    Servo (0), Motor (1), Sweep (2), Query (3)
+ * System:    Servo (0), Motor (1), Sweep (2), Query (3), Flip (4)
  * Direction: left (0), right (1), up (2), down (3)
  *            — ignored for Sweep and Query
  * Amount:    Servo: target angle as 0.0–1.0 (→ 0–180°)
@@ -42,6 +42,11 @@
  *   dist_cm is the partial encoder distance covered before the stop.
  *   No DONE is sent for that segment.
  *
+ * Flip protocol:
+ *   Pi sends      (4, 0, 1.0, 0)  — enter flipped mode
+ *   Pi sends      (4, 0, 0.0, 0)  — return to normal mode
+ *   When flipped: motor directions invert, ground ultrasonic switches to upward sensor
+ *
  * Handshake:
  *   Arduino sends  "READY"  every second until Pi replies "ACK"
  */
@@ -57,9 +62,13 @@
 
 #define PIN_TILT 11  // Camera tilt servo
 
-// Downward-facing ultrasonic (HC-SR04) — cliff / drop-off detection
+// Downward-facing ultrasonic (HC-SR04) — cliff / drop-off detection (normal mode)
 #define PIN_ULTRA_DOWN_TRIG A0
 #define PIN_ULTRA_DOWN_ECHO A1
+
+// Upward-facing ultrasonic (HC-SR04) — cliff detection when rover is inverted
+#define PIN_ULTRA_UP_TRIG A2
+#define PIN_ULTRA_UP_ECHO A3
 
 // Encoder (SparkFun 64 P/R quadrature) — hardware interrupt pins
 #define ENCODER_A 2  // interrupt pin — channel A
@@ -74,6 +83,7 @@
 #define SYS_MOTOR 1
 #define SYS_SWEEP 2
 #define SYS_QUERY 3
+#define SYS_FLIP  4
 
 // Encoder odometry — calibrate DIST_PER_REV_CM for your track
 #define COUNTS_PER_REV   64     // 64 P/R, 1x decoding (rising edge on A)
@@ -153,6 +163,9 @@ void stopMotors() {
     analogWrite(PIN_ENB, 0);
 }
 
+// ── Flip state ────────────────────────────────────────────────────────────────
+bool flipped = false;  // set by Pi via SYS_FLIP command
+
 // ── Ultrasonic / cliff detection ──────────────────────────────────────────────
 // Returns distance in cm; 999.0 if nothing detected within timeout.
 float readUltrasonicDown() {
@@ -161,8 +174,23 @@ float readUltrasonicDown() {
     digitalWrite(PIN_ULTRA_DOWN_TRIG, HIGH);
     delayMicroseconds(10);
     digitalWrite(PIN_ULTRA_DOWN_TRIG, LOW);
-    long us = pulseIn(PIN_ULTRA_DOWN_ECHO, HIGH, 30000UL);  // 30 ms → ~5 m max
-    return (us == 0) ? 999.0f : us * 0.01715f;              // µs → cm
+    long us = pulseIn(PIN_ULTRA_DOWN_ECHO, HIGH, 30000UL);
+    return (us == 0) ? 999.0f : us * 0.01715f;
+}
+
+float readUltrasonicUp() {
+    digitalWrite(PIN_ULTRA_UP_TRIG, LOW);
+    delayMicroseconds(2);
+    digitalWrite(PIN_ULTRA_UP_TRIG, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(PIN_ULTRA_UP_TRIG, LOW);
+    long us = pulseIn(PIN_ULTRA_UP_ECHO, HIGH, 30000UL);
+    return (us == 0) ? 999.0f : us * 0.01715f;
+}
+
+// Returns the ground-facing reading regardless of rover orientation
+float readGroundSensor() {
+    return flipped ? readUltrasonicUp() : readUltrasonicDown();
 }
 
 // Turn left (counter-clockwise) for a given number of degrees
@@ -252,8 +280,17 @@ void handleMotor(int direction, float distanceCm, float speed) {
     int pwm = (int)(speed * 255.0f);
     pwm = constrain(pwm, 0, 255);
 
+    // When upside-down, all directions are physically reversed
+    int effectiveDir = direction;
+    if (flipped) {
+        if      (effectiveDir == DIR_UP)    effectiveDir = DIR_DOWN;
+        else if (effectiveDir == DIR_DOWN)  effectiveDir = DIR_UP;
+        else if (effectiveDir == DIR_LEFT)  effectiveDir = DIR_RIGHT;
+        else if (effectiveDir == DIR_RIGHT) effectiveDir = DIR_LEFT;
+    }
+
     bool forward;
-    switch (direction) {
+    switch (effectiveDir) {
         case DIR_UP:    forward = true;  break;
         case DIR_DOWN:  forward = false; break;
         case DIR_LEFT:
@@ -293,8 +330,8 @@ void handleMotor(int direction, float distanceCm, float speed) {
         interrupts();
         if (travelled >= targetCounts) break;
 
-        // Check downward ultrasonic — abort if ground disappears
-        if (readUltrasonicDown() > CLIFF_THRESHOLD_CM) {
+        // Check ground sensor (down normally, up when flipped) — abort if ground disappears
+        if (readGroundSensor() > CLIFF_THRESHOLD_CM) {
             cliffDetected = true;
             break;
         }
@@ -341,12 +378,17 @@ void handleQuery() {
     Serial.println(distanceCm);
 }
 
+void handleFlip(float amount) {
+    flipped = (amount >= 0.5f);
+}
+
 void dispatch(const Command& cmd) {
     switch (cmd.system) {
         case SYS_SERVO: handleServo(cmd.direction, cmd.amount, cmd.speed); break;
         case SYS_MOTOR: handleMotor(cmd.direction, cmd.amount, cmd.speed); break;
         case SYS_SWEEP: handleSweep(cmd.amount, cmd.speed);                break;
         case SYS_QUERY: handleQuery();                                      break;
+        case SYS_FLIP:  handleFlip(cmd.amount);                            break;
     }
 }
 
@@ -358,9 +400,11 @@ void setup() {
     pinMode(PIN_ENB, OUTPUT); pinMode(PIN_IN3, OUTPUT); pinMode(PIN_IN4, OUTPUT);
     stopMotors();
 
-    // Ultrasonic
+    // Ultrasonic sensors
     pinMode(PIN_ULTRA_DOWN_TRIG, OUTPUT);
     pinMode(PIN_ULTRA_DOWN_ECHO, INPUT);
+    pinMode(PIN_ULTRA_UP_TRIG,   OUTPUT);
+    pinMode(PIN_ULTRA_UP_ECHO,   INPUT);
 
     // Encoder
     pinMode(ENCODER_A, INPUT_PULLUP);
@@ -387,13 +431,13 @@ void setup() {
 }
 
 void loop() {
-    // Idle cliff check — rate-limited so Pi isn't flooded while stationary
+    // Idle cliff check — uses ground-facing sensor (auto-selects based on flip state)
     if (millis() - lastCliffAlert >= CLIFF_ALERT_INTERVAL) {
-        float downDist = readUltrasonicDown();
-        if (downDist > CLIFF_THRESHOLD_CM) {
+        float groundDist = readGroundSensor();
+        if (groundDist > CLIFF_THRESHOLD_CM) {
             stopMotors();
             Serial.print("CLIFF:");
-            Serial.println(downDist);
+            Serial.println(groundDist);
             lastCliffAlert = millis();
         }
     }

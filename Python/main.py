@@ -69,7 +69,7 @@ BAUD_RATE         = 9600
 HANDSHAKE_TIMEOUT = 10  # seconds to wait for READY
 
 # ── Command constants ─────────────────────────────────────────────────────────
-SERVO, MOTOR, SWEEP, QUERY = 0, 1, 2, 3
+SERVO, MOTOR, SWEEP, QUERY, FLIP = 0, 1, 2, 3, 4
 LEFT, RIGHT, UP, DOWN = 0, 1, 2, 3
 
 # ── LIDAR (Garmin LIDAR-Lite v4 LED) ─────────────────────────────────────────
@@ -91,9 +91,14 @@ _MAG_CNTL2 = 0x31  # control 2 — measurement mode
 _MAG_ST1   = 0x10  # status 1  — DRDY bit 0
 _MAG_HXL   = 0x11  # first measurement byte (little-endian X/Y/Z + ST2)
 
+# ── Flip detection ────────────────────────────────────────────────────────────
+FLIP_DETECT_THRESHOLD = 0.5   # |az| below −threshold → rover is inverted
+
+_flipped: bool = False  # tracks current flip state; updated by check_and_update_flip
+
 # ── Cliff detection ───────────────────────────────────────────────────────────
 CLIFF_DROP_CM      = 5     # cliff cell is marked this many cm below current cell
-PITCH_UP_THRESHOLD = 10.0  # degrees — above this, cliff alert is a normal slope
+PITCH_UP_THRESHOLD = 30.0  # degrees — above this, cliff alert is a normal slope
 
 # ── Map configuration ─────────────────────────────────────────────────────────
 MAP_WIDTH_M  = 3.0   # physical width  in metres
@@ -130,6 +135,26 @@ def send_command(ser: serial.Serial, system: int, direction: int, amount: float,
 # ── IMU functions ────────────────────────────────────────────────────────────
 def _icm_bank(bus: smbus2.SMBus, bank: int) -> None:
     bus.write_byte_data(ICM_ADDR, REG_BANK_SEL, bank << 4)
+
+
+def read_accel_z(bus: smbus2.SMBus) -> float:
+    """Return the Z-axis accelerometer reading in g (≈ +1 normal, ≈ −1 inverted)."""
+    _icm_bank(bus, 0)
+    raw = bus.read_i2c_block_data(ICM_ADDR, _ACCEL_XOUT_H, 6)
+    return struct.unpack(">h", bytes(raw[4:6]))[0] / 16384.0
+
+
+def check_and_update_flip(ser: serial.Serial, bus: smbus2.SMBus) -> None:
+    """
+    Detect rover inversion from the IMU Z-axis and inform the Arduino if the
+    flip state changes.  Sends FLIP only on transitions to avoid serial spam.
+    """
+    global _flipped
+    az = read_accel_z(bus)
+    now_flipped = az < -FLIP_DETECT_THRESHOLD
+    if now_flipped != _flipped:
+        _flipped = now_flipped
+        send_command(ser, FLIP, 0, 1.0 if _flipped else 0.0, 0.0)
 
 
 def init_imu(bus: smbus2.SMBus) -> None:
@@ -175,7 +200,9 @@ def read_heading(bus: smbus2.SMBus) -> float:
             + my * math.cos(roll)
             - mz * math.sin(roll) * math.cos(pitch))
 
-    return math.degrees(math.atan2(-my_c, mx_c)) % 360
+    heading = math.degrees(math.atan2(-my_c, mx_c)) % 360
+    # When inverted, effective forward direction is 180° opposite the compass
+    return (heading + 180) % 360 if _flipped else heading
 
 
 def read_pitch(bus: smbus2.SMBus) -> float:
@@ -188,7 +215,9 @@ def read_pitch(bus: smbus2.SMBus) -> float:
     ax = struct.unpack(">h", bytes(raw[0:2]))[0] / 16384.0
     ay = struct.unpack(">h", bytes(raw[2:4]))[0] / 16384.0
     az = struct.unpack(">h", bytes(raw[4:6]))[0] / 16384.0
-    return math.degrees(math.atan2(-ax, math.sqrt(ay**2 + az**2)))
+    pitch = math.degrees(math.atan2(-ax, math.sqrt(ay**2 + az**2)))
+    # When inverted, the pitch sign convention is reversed relative to forward travel
+    return -pitch if _flipped else pitch
 
 
 # ── LIDAR ─────────────────────────────────────────────────────────────────────
@@ -426,9 +455,12 @@ def main() -> None:
     x, y = ROWS - 1, COLS // 2
 
     while True:
+        # Detect flip; sends FLIP command to Arduino only on state change
+        check_and_update_flip(ser, bus)
+
         # Update position from encoder + IMU
         dist_cm  = query_distance(ser)
-        heading  = read_heading(bus)
+        heading  = read_heading(bus)   # already corrected for flip state
         x, y     = update_position(x, y, dist_cm, heading, initial_heading)
 
         # TODO: sensor_sweep(ser, bus, heightmap, x, y, range_deg=90.0, step_ms=200.0)

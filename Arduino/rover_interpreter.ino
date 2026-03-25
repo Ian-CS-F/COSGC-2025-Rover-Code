@@ -56,7 +56,12 @@
 #define PIN_IN1  6
 #define PIN_IN2  7
 
-#define PIN_ENB  10  // PWM  — right motor
+// NOTE: On Arduino Uno the Servo library takes over Timer1, which disables
+// analogWrite() on pins 9 AND 10.  PIN_ENB must therefore NOT use pin 9 or 10.
+// It is assigned to pin 3 (Timer2) to avoid this conflict.
+// ENCODER_B moved from pin 3 to pin 4 to free up pin 3 for PIN_ENB.
+// Update your wiring accordingly: ENB wire → pin 3, encoder B wire → pin 4.
+#define PIN_ENB  3   // PWM  — right motor  (Timer2 — safe with Servo library)
 #define PIN_IN3  8
 #define PIN_IN4  9
 
@@ -71,8 +76,8 @@
 #define PIN_ULTRA_UP_ECHO A3
 
 // Encoder (SparkFun 64 P/R quadrature) — hardware interrupt pins
-#define ENCODER_A 2  // interrupt pin — channel A
-#define ENCODER_B 3  // direction pin — channel B
+#define ENCODER_A 2  // interrupt pin — channel A (must stay on 2 or 3)
+#define ENCODER_B 4  // direction pin — channel B (digital read only, any pin works)
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 #define BAUD_RATE 9600

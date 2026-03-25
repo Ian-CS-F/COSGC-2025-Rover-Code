@@ -176,9 +176,9 @@ def main() -> int:
     parser.add_argument("--baud", type=int, default=9600,  help="Baud rate")
     args = parser.parse_args()
 
-    print(f"Opening {"/dev/cu.usbmodem1051DB35933C2"} at {9600} baud…")
+    print(f"Opening {args.port} at {args.baud} baud…")
     try:
-        ser = serial.Serial("/dev/cu.usbmodem1051DB35933C2", 9600, timeout=2.0)
+        ser = serial.Serial(args.port, args.baud, timeout=2.0)
     except serial.SerialException as exc:
         print(f"ERROR: {exc}")
         return 1

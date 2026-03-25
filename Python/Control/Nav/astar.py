@@ -27,8 +27,8 @@ class AStar:
         self,
         heightmap: Heightmap,
         diagonal: bool = False,
-        turn_penalty: float = 1.0,
-        max_height_diff: int = 1,
+        turn_penalty: float = 1.5,
+        max_height_diff: int = 3,
     ):
         self.heightmap = heightmap
         self.rows = heightmap.rows

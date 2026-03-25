@@ -47,13 +47,14 @@ Arduino → Pi:
 """
 
 import math
+import os
 import struct
 import sys
 import time
 import serial
 import smbus2  # type: ignore
 
-sys.path.append("Control/Nav")
+sys.path.append(os.path.join(os.path.dirname(__file__), "Control/Nav"))
 from heightmap import Heightmap  # type: ignore
 from astar import AStar          # type: ignore
 
@@ -113,6 +114,7 @@ GOAL_TOLERANCE_CELLS  = 3     # Euclidean cell distance that counts as "arrived"
 SWEEP_EVERY_N_STEPS   = 5     # resweep and replan after this many path steps
 STRAIGHT_SEGMENT_CM   = 50.0  # segment length when driving straight toward goal
 STRAIGHT_MAX_SEGMENTS = 20    # maximum straight segments before giving up
+SWEEP_TIMEOUT_S       = 300.0 # hard cap waiting for SWEEP_DONE (5 minutes)
 
 
 # ── Serial init ───────────────────────────────────────────────────────────────
@@ -292,12 +294,14 @@ def move_rover(ser: serial.Serial, direction: int, total_cm: float) -> float:
     while remaining > 1.0:
         segment = remaining
         actual, error_ratio = drive_segment(ser, direction, segment, _drive_speed)
+        if actual == 0.0 and error_ratio == 0.0:
+            break  # drive_segment timed out — abort to avoid infinite loop
         travelled += actual
         remaining -= actual
 
         # Update the persistent speed whenever error deviates past threshold.
-        # error_ratio > 1 → slipping (reduce speed for better grip)
-        # error_ratio < 1 → stalling (reduce speed to avoid motor strain)
+        # error_ratio > 1 → slipping  (reduce speed for better grip)
+        # error_ratio < 1 → stalling  (increase speed to overcome resistance)
         if abs(error_ratio - 1.0) > SLIP_THRESHOLD:
             _drive_speed = max(MIN_DRIVE_SPEED, _drive_speed / error_ratio)
 
@@ -408,7 +412,11 @@ def sensor_sweep(
     rover_pitch = read_pitch(bus)  # degrees, positive = nose up
     send_command(ser, SWEEP, 0, range_deg, step_ms)
 
+    sweep_deadline = time.monotonic() + SWEEP_TIMEOUT_S
     while True:
+        if time.monotonic() > sweep_deadline:
+            print("WARNING: sensor_sweep timed out waiting for SWEEP_DONE")
+            break
         line = ser.readline().decode(errors="replace").strip()
 
         if line == "SWEEP_DONE":
@@ -479,6 +487,7 @@ def handle_cliff(
 
     # Full 360° sweep to update surroundings before replanning
     sensor_sweep(ser, bus, heightmap, x, y, range_deg=360.0, step_ms=200.0)
+    heightmap.compute_slopes()
 
     return None  # caller should call planner.find_path() with the updated map
 
@@ -519,6 +528,7 @@ def follow_path(
         # Periodic resweep + replan to incorporate new surroundings
         if steps_since_sweep >= SWEEP_EVERY_N_STEPS:
             sensor_sweep(ser, bus, heightmap, x, y, range_deg=90.0, step_ms=200.0)
+            heightmap.compute_slopes()
             path = planner.find_path((x, y), goal) or []
             steps_since_sweep = 0
             if not path:
@@ -610,6 +620,7 @@ def drive_straight_toward_goal(
 
         # Sweep and retry A* after each segment
         sensor_sweep(ser, bus, heightmap, x, y, range_deg=90.0, step_ms=200.0)
+        heightmap.compute_slopes()
         path = planner.find_path((x, y), goal)
         if path:
             print(f"Path to goal found after {seg + 1} straight segment(s)")
@@ -621,63 +632,68 @@ def drive_straight_toward_goal(
 # ── Boot ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     ser = init_serial()
-
     bus = smbus2.SMBus(I2C_BUS)
-    init_imu(bus)
-    initial_heading = read_heading(bus)
-    print(f"Initial heading: {initial_heading:.1f}°")
+    try:
+        init_imu(bus)
+        initial_heading = read_heading(bus)
+        print(f"Initial heading: {initial_heading:.1f}°")
 
-    heightmap = Heightmap(ROWS, COLS)
-    planner   = AStar(heightmap, diagonal=True, turn_penalty=1.0, max_height_diff=2)
+        heightmap = Heightmap(ROWS, COLS)
+        planner   = AStar(heightmap, diagonal=True, turn_penalty=1.0, max_height_diff=2)
 
-    print(f"Map: {ROWS} rows × {COLS} cols  ({RESOLUTION_M} m/cell)")
+        print(f"Map: {ROWS} rows × {COLS} cols  ({RESOLUTION_M} m/cell)")
 
-    # Starting grid position — middle bottom (rover travels forward/up the grid)
-    x, y = ROWS - 1, COLS // 2
+        # Starting grid position — middle bottom (rover travels forward/up the grid)
+        x, y = ROWS - 1, COLS // 2
 
-    # Goal: middle of the far end of the course
-    goal = (0, COLS // 2)
+        # Goal: middle of the far end of the course
+        goal = (0, COLS // 2)
 
-    # Initial forward sweep to build the map before planning
-    print("Initial sensor sweep…")
-    sensor_sweep(ser, bus, heightmap, x, y, range_deg=90.0, step_ms=200.0)
+        # Initial forward sweep to build the map before planning
+        print("Initial sensor sweep…")
+        sensor_sweep(ser, bus, heightmap, x, y, range_deg=90.0, step_ms=200.0)
+        heightmap.compute_slopes()
 
-    path = planner.find_path((x, y), goal)
-    if path is None:
-        print("No initial path to goal — driving straight toward goal…")
-        x, y, path = drive_straight_toward_goal(
-            ser, bus, heightmap, planner, x, y, initial_heading, goal
-        )
-        if path is None:
-            print("Could not reach goal — stopped")
-            return
-
-    print(f"Path found: {len(path)} cells  Goal: {goal}")
-
-    while True:
-        check_and_update_flip(ser, bus)
-
-        x, y = follow_path(ser, bus, heightmap, planner, path, x, y, initial_heading, goal)
-
-        if math.hypot(x - goal[0], y - goal[1]) <= GOAL_TOLERANCE_CELLS:
-            print(f"Goal reached at ({x}, {y})")
-            break
-
-        # Path exhausted without reaching goal — do a full sweep and replan
-        print("Path exhausted, doing 360° sweep and replanning…")
-        sensor_sweep(ser, bus, heightmap, x, y, range_deg=360.0, step_ms=200.0)
         path = planner.find_path((x, y), goal)
-        if path is not None:
-            print(f"Replanned: {len(path)} cells remaining")
-            continue
-
-        # Still no path after full sweep — drive straight toward goal
-        x, y, path = drive_straight_toward_goal(
-            ser, bus, heightmap, planner, x, y, initial_heading, goal
-        )
         if path is None:
-            print("No path found after straight drive — stopped")
-            break
+            print("No initial path to goal — driving straight toward goal…")
+            x, y, path = drive_straight_toward_goal(
+                ser, bus, heightmap, planner, x, y, initial_heading, goal
+            )
+            if path is None:
+                print("Could not reach goal — stopped")
+                return
+
+        print(f"Path found: {len(path)} cells  Goal: {goal}")
+
+        while True:
+            check_and_update_flip(ser, bus)
+
+            x, y = follow_path(ser, bus, heightmap, planner, path, x, y, initial_heading, goal)
+
+            if math.hypot(x - goal[0], y - goal[1]) <= GOAL_TOLERANCE_CELLS:
+                print(f"Goal reached at ({x}, {y})")
+                break
+
+            # Path exhausted without reaching goal — do a full sweep and replan
+            print("Path exhausted, doing 360° sweep and replanning…")
+            sensor_sweep(ser, bus, heightmap, x, y, range_deg=360.0, step_ms=200.0)
+            heightmap.compute_slopes()
+            path = planner.find_path((x, y), goal)
+            if path is not None:
+                print(f"Replanned: {len(path)} cells remaining")
+                continue
+
+            # Still no path after full sweep — drive straight toward goal
+            x, y, path = drive_straight_toward_goal(
+                ser, bus, heightmap, planner, x, y, initial_heading, goal
+            )
+            if path is None:
+                print("No path found after straight drive — stopped")
+                break
+    finally:
+        ser.close()
+        bus.close()
 
 
 if __name__ == "__main__":

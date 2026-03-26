@@ -8,7 +8,7 @@ import time
 import serial
 
 # ── Constants from main.py ────────────────────────────────────────────────────
-SERIAL_PORT       = "/dev/ttyUSB0"
+SERIAL_PORT       = "/dev/ttyACM0"
 BAUD_RATE         = 9600
 HANDSHAKE_TIMEOUT = 10
 
@@ -74,6 +74,7 @@ def test_query_distance():
     print("TEST: QUERY command returns DIST:<cm> response...")
     try:
         ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+        time.sleep(2)  # let Arduino reset after DTR toggle
         ser.reset_input_buffer()
 
         # Handshake first
@@ -92,6 +93,7 @@ def test_query_distance():
             return False
 
         # Send QUERY (system=3)
+        time.sleep(0.5)
         ser.write(b"(3,0,0.000,0.000)\n")
 
         deadline = time.monotonic() + 3.0

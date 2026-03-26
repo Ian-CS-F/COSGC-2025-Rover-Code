@@ -172,13 +172,13 @@ def test_bad_packet(ser: serial.Serial) -> bool:
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> int:
     parser = argparse.ArgumentParser(description="Pi ↔ Arduino communication test")
-    parser.add_argument("--port", default="/dev/ttyUSB0", help="Serial port")
+    parser.add_argument("--port", default="/dev/ttyACM0", help="Serial port")
     parser.add_argument("--baud", type=int, default=9600,  help="Baud rate")
     args = parser.parse_args()
 
     print(f"Opening {args.port} at {args.baud} baud…")
     try:
-        ser = serial.Serial(args.port, args.baud, timeout=2.0)
+        ser = serial.Serial("/dev/ttyACM0", 9600, timeout=2.0)
     except serial.SerialException as exc:
         print(f"ERROR: {exc}")
         return 1

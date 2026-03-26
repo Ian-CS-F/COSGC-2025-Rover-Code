@@ -65,7 +65,7 @@ class CliffDetected(Exception):
         self.partial_cm = partial_cm  # encoder distance covered before stop
 
 # ── Serial ────────────────────────────────────────────────────────────────────
-SERIAL_PORT       = "/dev/ttyUSB0"
+SERIAL_PORT       = "/dev/ttyACM0"
 BAUD_RATE         = 9600
 HANDSHAKE_TIMEOUT = 10  # seconds to wait for READY
 

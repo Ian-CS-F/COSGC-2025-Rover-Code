@@ -134,6 +134,153 @@ Set `SERIAL_PORT` in `main.py` if your Arduino appears on a different device
 
 ---
 
+## Computer Development Mode (No Raspberry Pi Required)
+
+Team members can run the full navigation stack and drive the rover manually from
+any Windows, Mac, or Linux laptop. Two configurations are supported:
+
+| Config | What you need | What works |
+|---|---|---|
+| **Full hardware** | Motor Arduino + Sensor Arduino + IMU + LIDAR | Everything |
+| **Motor only** | Motor Arduino only | Drive / encoder / ultrasonics |
+| **No hardware** | Nothing | Navigation logic, mock sensors |
+
+---
+
+### Hardware Setup
+
+#### Motor Arduino (rover_interpreter.ino)
+This is the same Arduino that runs on the rover. Connect it to your laptop via USB.
+No wiring changes needed — it uses the same serial protocol as the Pi.
+
+#### Sensor Arduino (i2c_bridge.ino)
+A second Arduino (Uno or Mega) acts as an I2C bridge, reading the IMU and LIDAR
+and streaming the data to the laptop over serial.
+
+**Wiring:**
+
+| Sensor | Arduino Pin | Notes |
+|---|---|---|
+| SDA | A4 (Uno) / 20 (Mega) | Shared bus |
+| SCL | A5 (Uno) / 21 (Mega) | Shared bus |
+| ICM-20948 VCC | 3.3 V | |
+| ICM-20948 GND | GND | |
+| ICM-20948 AD0 | 3.3 V | **Required** — sets address to 0x69 |
+| LIDAR-Lite v4 VCC | 5 V | Needs up to 1 A at startup |
+| LIDAR-Lite v4 GND | GND | |
+
+Both sensors share the same SDA/SCL lines. Both communicate at I2C 400 kHz.
+
+**Upload `Arduino/i2c_bridge/i2c_bridge.ino` to the sensor Arduino.**
+
+You can verify it's working by opening the Serial Monitor at 9600 baud —
+you should see `IMU:` and `LIDAR:` lines arriving every 100 ms.
+
+---
+
+### Software Setup
+
+Install Python dependencies (Windows, Mac, Linux):
+
+```bash
+pip install pyserial pynput
+```
+
+`smbus2` is **not** needed — that is Pi-only. `pynput` is for keyboard control.
+
+---
+
+### Port Configuration
+
+Open `Python/computer_main.py` and set the two port constants at the top:
+
+```python
+HARDWARE_MODE = True          # False = no hardware at all (mocked sensors)
+MOTOR_PORT    = "/dev/ttyUSB0"   # port for motor/encoder Arduino
+SENSOR_PORT   = "/dev/ttyUSB1"  # port for i2c_bridge Arduino
+```
+
+**Finding your port:**
+
+| OS | Command | Typical result |
+|---|---|---|
+| Linux | `ls /dev/ttyUSB* /dev/ttyACM*` | `/dev/ttyUSB0` |
+| Mac | `ls /dev/cu.usbmodem* /dev/cu.usbserial*` | `/dev/cu.usbmodem14201` |
+| Windows | Device Manager → Ports (COM & LPT) | `COM3`, `COM4` |
+
+Plug in one Arduino at a time and note which port appears — that is its port.
+
+---
+
+### Running
+
+```bash
+cd COSGC-2025-Rover-Code
+python Python/computer_main.py
+```
+
+You will be prompted to choose a mode:
+
+```
+Mode? [k]eyboard (default) / [a]utonomous:
+```
+
+---
+
+### Keyboard Control
+
+```
+W / ↑      Drive forward (continuous)
+S / ↓      Drive reverse (continuous)
+A / ←      Tank-turn left (continuous)
+D / →      Tank-turn right (continuous)
+
++  /  =    Increase speed (0.05 per press, max 1.0)
+-          Decrease speed (0.05 per press, min 0.1)
+
+SPACE      Toggle between keyboard and autonomous mode
+Q / ESC    Stop motors and quit
+```
+
+The terminal displays a live readout while driving:
+
+```
+=== COSGC Rover  |  KEYBOARD mode  |  HW: REAL ===
+  Heading :  127.3 deg     Pitch  :   2.1 deg
+  LiDAR   :    1.43 m      Encoder:  12.4 cm
+  Speed   :   0.50         Driving: FORWARD
+```
+
+**Motor commands are only sent when the key state changes** — holding W sends
+one command, not a flood of serial packets.
+
+---
+
+### No-Hardware Mode
+
+Set `HARDWARE_MODE = False` to run with completely mocked sensors.
+The navigation logic executes normally; sensor reads return static safe values
+(heading = 0°, LIDAR = 2 m, rover upright). Useful for testing path planning
+and serial protocol logic without any hardware connected.
+
+A `_MockSerial` class intercepts motor commands and prints them to the terminal
+instead of sending them over USB.
+
+---
+
+### Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `RuntimeError: Motor Arduino did not send READY` | Wrong port or Arduino not running rover_interpreter.ino | Check `MOTOR_PORT`, re-upload firmware |
+| `IMU not responding` warning at startup | AD0 not pulled to 3.3 V, or wrong firmware on sensor Arduino | Confirm AD0 wiring; re-upload i2c_bridge.ino |
+| `LIDAR not responding` warning | Power issue (LIDAR needs ~1 A at startup) or wiring | Use a powered USB hub; check 5 V supply |
+| `ModuleNotFoundError: pynput` | pynput not installed | `pip install pynput` |
+| Heading drifts badly | Magnetometer calibration | Hold the sensor Arduino and rotate it in a figure-8 pattern before use to calibrate the magnetometer |
+| `ERROR:IMU` lines in Serial Monitor | I2C pull-up resistors missing | Add 4.7 kΩ pull-ups on SDA and SCL to 3.3 V |
+
+---
+
 ## Path Planning
 
 `AStar` operates on a `Heightmap` grid (default 8 m × 3 m at 5 cm/cell).

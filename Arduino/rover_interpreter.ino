@@ -113,6 +113,14 @@
 #define CLIFF_THRESHOLD_CM    40.0f   // calibrate for your mounting height
 #define CLIFF_ALERT_INTERVAL  1000UL  // ms between idle CLIFF alerts
 
+// ── Packet parsing ────────────────────────────────────────────────────────────
+struct Command {
+    int   system;
+    int   direction;
+    float amount;
+    float speed;
+};
+
 // Tilt angles visited at each horizontal position (up then back down)
 const int TILT_ANGLES[]  = {60, 75, 90, 105, 120};
 const int TILT_COUNT     = sizeof(TILT_ANGLES) / sizeof(TILT_ANGLES[0]);
@@ -128,14 +136,6 @@ void encoderISR() {
 
 // ── Servo object ──────────────────────────────────────────────────────────────
 Servo tiltServo;
-
-// ── Packet parsing ────────────────────────────────────────────────────────────
-struct Command {
-    int   system;
-    int   direction;
-    float amount;
-    float speed;
-};
 
 bool parsePacket(const String& raw, Command& cmd) {
     int start = raw.indexOf('(');

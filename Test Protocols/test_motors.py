@@ -41,17 +41,24 @@ def send_command(ser, system, direction, amount, speed):
     ser.write(packet.encode())
 
 def wait_for_done(ser, timeout=MOTOR_DONE_TIMEOUT):
-    """Wait for DONE:<cm>,<ratio> and return (actual_cm, error_ratio), or None on timeout."""
+    """Wait for DONE:<left_cm>,<right_cm>,<left_ratio>,<right_ratio> and return
+    (left_cm, right_cm, left_ratio, right_ratio), or None on timeout.
+    Returns ("CLIFF", left_cm, right_cm) on cliff detection."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         line = ser.readline().decode(errors="replace").strip()
         if line.startswith("DONE:"):
             parts = line[5:].split(",")
-            actual_cm   = float(parts[0])
-            error_ratio = float(parts[1]) if len(parts) > 1 else 1.0
-            return actual_cm, error_ratio
+            left_cm    = float(parts[0])
+            right_cm   = float(parts[1]) if len(parts) > 1 else left_cm
+            left_ratio = float(parts[2]) if len(parts) > 2 else 1.0
+            right_ratio= float(parts[3]) if len(parts) > 3 else 1.0
+            return left_cm, right_cm, left_ratio, right_ratio
         if line.startswith("CLIFF:"):
-            return "CLIFF", float(line[6:])
+            parts = line[6:].split(",")
+            left_cm  = float(parts[0])
+            right_cm = float(parts[1]) if len(parts) > 1 else left_cm
+            return "CLIFF", left_cm, right_cm
     return None
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
@@ -72,11 +79,13 @@ def test_drive_forward():
         print("  FAIL — no DONE received within timeout")
         return False
     if result[0] == "CLIFF":
-        print(f"  FAIL — unexpected CLIFF at {result[1]:.1f} cm")
+        print(f"  FAIL — unexpected CLIFF (left={result[1]:.1f} cm, right={result[2]:.1f} cm)")
         return False
-    actual_cm, error_ratio = result
-    passed = actual_cm > 0.0
-    print(f"  Encoder distance: {actual_cm:.1f} cm  error_ratio: {error_ratio:.3f}  →  {'PASS' if passed else 'FAIL'}")
+    left_cm, right_cm, left_ratio, right_ratio = result
+    discrepancy = abs(left_cm - right_cm)
+    passed = left_cm > 0.0 and right_cm > 0.0
+    print(f"  Left: {left_cm:.1f} cm (ratio {left_ratio:.3f})  Right: {right_cm:.1f} cm (ratio {right_ratio:.3f})  "
+          f"Discrepancy: {discrepancy:.1f} cm  →  {'PASS' if passed else 'FAIL'}")
     return passed
 
 def test_drive_reverse():
@@ -93,11 +102,13 @@ def test_drive_reverse():
         print("  FAIL — no DONE received within timeout")
         return False
     if result[0] == "CLIFF":
-        print(f"  FAIL — unexpected CLIFF at {result[1]:.1f} cm")
+        print(f"  FAIL — unexpected CLIFF (left={result[1]:.1f} cm, right={result[2]:.1f} cm)")
         return False
-    actual_cm, error_ratio = result
-    passed = actual_cm > 0.0
-    print(f"  Encoder distance: {actual_cm:.1f} cm  error_ratio: {error_ratio:.3f}  →  {'PASS' if passed else 'FAIL'}")
+    left_cm, right_cm, left_ratio, right_ratio = result
+    discrepancy = abs(left_cm - right_cm)
+    passed = left_cm > 0.0 and right_cm > 0.0
+    print(f"  Left: {left_cm:.1f} cm (ratio {left_ratio:.3f})  Right: {right_cm:.1f} cm (ratio {right_ratio:.3f})  "
+          f"Discrepancy: {discrepancy:.1f} cm  →  {'PASS' if passed else 'FAIL'}")
     return passed
 
 def test_turn_left():
@@ -116,19 +127,22 @@ def test_turn_left():
     send_command(ser, MOTOR, UP, 0.0, 0.0)    # stop
     # QUERY the encoder to confirm wheels moved
     send_command(ser, QUERY, 0, 0.0, 0.0)
-    dist = None
+    left_cm = right_cm = None
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline:
         line = ser.readline().decode(errors="replace").strip()
         if line.startswith("DIST:"):
-            dist = float(line[5:])
+            parts = line[5:].split(",")
+            left_cm  = float(parts[0])
+            right_cm = float(parts[1]) if len(parts) > 1 else left_cm
             break
     ser.close()
-    if dist is None:
+    if left_cm is None:
         print("  FAIL — no DIST response from QUERY")
         return False
-    passed = abs(dist) > 0.0
-    print(f"  Encoder: {dist:.2f} cm  →  {'PASS' if passed else 'FAIL (no movement detected)'}")
+    # During a left tank-turn, left wheel goes back and right goes forward
+    passed = abs(left_cm) > 0.0 and abs(right_cm) > 0.0
+    print(f"  Left: {left_cm:.2f} cm  Right: {right_cm:.2f} cm  →  {'PASS' if passed else 'FAIL (no movement detected)'}")
     return passed
 
 def test_turn_right():
@@ -146,19 +160,22 @@ def test_turn_right():
     send_command(ser, MOTOR, UP, 0.0, 0.0)     # stop
     # QUERY the encoder to confirm wheels moved
     send_command(ser, QUERY, 0, 0.0, 0.0)
-    dist = None
+    left_cm = right_cm = None
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline:
         line = ser.readline().decode(errors="replace").strip()
         if line.startswith("DIST:"):
-            dist = float(line[5:])
+            parts = line[5:].split(",")
+            left_cm  = float(parts[0])
+            right_cm = float(parts[1]) if len(parts) > 1 else left_cm
             break
     ser.close()
-    if dist is None:
+    if left_cm is None:
         print("  FAIL — no DIST response from QUERY")
         return False
-    passed = abs(dist) > 0.0
-    print(f"  Encoder: {dist:.2f} cm  →  {'PASS' if passed else 'FAIL (no movement detected)'}")
+    # During a right tank-turn, right wheel goes back and left goes forward
+    passed = abs(left_cm) > 0.0 and abs(right_cm) > 0.0
+    print(f"  Left: {left_cm:.2f} cm  Right: {right_cm:.2f} cm  →  {'PASS' if passed else 'FAIL (no movement detected)'}")
     return passed
 
 def test_ultrasonic_ground_detected():
@@ -180,10 +197,10 @@ def test_ultrasonic_ground_detected():
         print("  FAIL — no response")
         return False
     if result[0] == "CLIFF":
-        print(f"  FAIL — unexpected CLIFF at {result[1]:.1f} cm (sensor may not see ground)")
+        print(f"  FAIL — unexpected CLIFF (left={result[1]:.1f} cm, right={result[2]:.1f} cm, sensor may not see ground)")
         return False
-    actual_cm, _ = result
-    print(f"  Drive completed {actual_cm:.1f} cm with no cliff  →  PASS")
+    left_cm, right_cm, _, _ = result
+    print(f"  Drive completed — left {left_cm:.1f} cm, right {right_cm:.1f} cm, no cliff  →  PASS")
     return True
 
 def test_ultrasonic_cliff_detected():
@@ -207,7 +224,7 @@ def test_ultrasonic_cliff_detected():
         print("  FAIL — no CLIFF or DONE received within 15 s")
         return False
     if result[0] == "CLIFF":
-        print(f"  CLIFF detected at {result[1]:.1f} cm  →  PASS")
+        print(f"  CLIFF detected — left {result[1]:.1f} cm, right {result[2]:.1f} cm  →  PASS")
         return True
     print(f"  FAIL — got DONE instead of CLIFF (motors stopped before cliff was triggered)")
     return False

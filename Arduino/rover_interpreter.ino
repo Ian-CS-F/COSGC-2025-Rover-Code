@@ -17,9 +17,9 @@
  * Motor distance protocol:
  *   Pi sends      (1, <dir>, <distance_cm>, <speed>)
  *   Arduino drives until encoder reaches target (or timeout), then stops
- *   Arduino sends "DONE:<actual_cm>,<error_ratio>"
- *     actual_cm   — encoder-measured distance covered
- *     error_ratio — actual_counts / target_counts
+ *   Arduino sends "DONE:<left_cm>,<right_cm>,<left_ratio>,<right_ratio>"
+ *     left_cm / right_cm   — encoder-measured distance per side
+ *     left_ratio/right_ratio — actual_counts / target_counts per side
  *                   > 1.0 : wheels spun more than expected (slipping)
  *                   < 1.0 : fewer counts than expected (stalled / very slow)
  *   (If distance_cm == 0, motors run continuously; no DONE is sent)
@@ -34,12 +34,12 @@
  *
  * Query protocol:
  *   Pi sends      (3, 0, 0, 0)
- *   Arduino sends "DIST:<cm>"  — distance since last query, then resets counter
+ *   Arduino sends "DIST:<left_cm>,<right_cm>"  — distance per side since last query, then resets counters
  *
  * Cliff detection (Arduino → Pi, unsolicited):
- *   Arduino sends "CLIFF:<dist_cm>"  when the downward ultrasonic loses the
+ *   Arduino sends "CLIFF:<left_cm>,<right_cm>"  when the downward ultrasonic loses the
  *   ground mid-drive.  Motors are already stopped when this is sent.
- *   dist_cm is the partial encoder distance covered before the stop.
+ *   left_cm/right_cm are the partial encoder distances covered before the stop.
  *   No DONE is sent for that segment.
  *
  * Flip protocol:
@@ -61,11 +61,11 @@
 // It is assigned to pin 3 (Timer2) to avoid this conflict.
 // ENCODER_B moved from pin 3 to pin 4 to free up pin 3 for PIN_ENB.
 // Update your wiring accordingly: ENB wire → pin 3, encoder B wire → pin 4.
-#define PIN_ENB  3   // PWM  — right motor  (Timer2 — safe with Servo library)
+#define PIN_ENB  4   // PWM  — right motor  (Timer2 — safe with Servo library)
 #define PIN_IN3  8
 #define PIN_IN4  9
 
-#define PIN_TILT 11  // Camera tilt servo
+#define PIN_TILT 12  // Camera tilt servo
 
 // Downward-facing ultrasonic (HC-SR04) — cliff / drop-off detection (normal mode)
 #define PIN_ULTRA_DOWN_TRIG A0
@@ -75,9 +75,14 @@
 #define PIN_ULTRA_UP_TRIG A2
 #define PIN_ULTRA_UP_ECHO A3
 
-// Encoder (SparkFun 64 P/R quadrature) — hardware interrupt pins
-#define ENCODER_A 2  // interrupt pin — channel A (must stay on 2 or 3)
-#define ENCODER_B 4  // direction pin — channel B (digital read only, any pin works)
+// Left encoder (SparkFun 64 P/R quadrature) — hardware interrupt pin
+#define ENCODER_A_LEFT  2   // interrupt pin — channel A (hardware INT0)
+#define ENCODER_B_LEFT  3   // direction pin — channel B
+
+// Right encoder — pin-change interrupt (PCINT0_vect / PORTB)
+// Pin 10 = PB2 (PCINT2), Pin 12 = PB4 (PCINT4)
+#define ENCODER_A_RIGHT 10  // pin-change interrupt pin — channel A (GREEN)
+#define ENCODER_B_RIGHT 11  // direction pin — channel B (WHITE)
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 #define BAUD_RATE 9600
@@ -126,12 +131,27 @@ const int TILT_ANGLES[]  = {60, 75, 90, 105, 120};
 const int TILT_COUNT     = sizeof(TILT_ANGLES) / sizeof(TILT_ANGLES[0]);
 
 // ── Encoder state ─────────────────────────────────────────────────────────────
-volatile long encoderCount = 0;
+volatile long encoderCountLeft  = 0;
+volatile long encoderCountRight = 0;
 
-void encoderISR() {
-    // Rising edge on A: B HIGH = forward, B LOW = backward
-    if (digitalRead(ENCODER_B)) encoderCount++;
-    else                         encoderCount--;
+// Left encoder — hardware interrupt on ENCODER_A_LEFT (INT0)
+void encoderISR_Left() {
+    if (digitalRead(ENCODER_B_LEFT)) encoderCountLeft++;
+    else                              encoderCountLeft--;
+}
+
+// Right encoder — pin-change interrupt on ENCODER_A_RIGHT (PCINT0_vect / PORTB)
+// We track the last state of PB2 (pin 10) to detect rising edges only.
+static volatile uint8_t lastPORTB = 0;
+ISR(PCINT0_vect) {
+    uint8_t cur = PINB;
+    uint8_t changed = cur ^ lastPORTB;
+    lastPORTB = cur;
+    // React only to rising edge on PB2 (pin 10 = ENCODER_A_RIGHT)
+    if ((changed & (1 << PB2)) && (cur & (1 << PB2))) {
+        if (digitalRead(ENCODER_B_RIGHT)) encoderCountRight++;
+        else                               encoderCountRight--;
+    }
 }
 
 // ── Servo object ──────────────────────────────────────────────────────────────
@@ -320,9 +340,10 @@ void handleMotor(int direction, float distanceCm, float speed) {
         return;
     }
 
-    // Distance-controlled mode: snapshot encoder, drive until target, then stop
+    // Distance-controlled mode: snapshot both encoders, drive until target, then stop
     noInterrupts();
-    long startCount = encoderCount;
+    long startLeft  = encoderCountLeft;
+    long startRight = encoderCountRight;
     interrupts();
 
     long targetCounts = (long)(distanceCm / DIST_PER_REV_CM * COUNTS_PER_REV);
@@ -331,9 +352,11 @@ void handleMotor(int direction, float distanceCm, float speed) {
 
     while (millis() < deadline) {
         noInterrupts();
-        long travelled = abs(encoderCount - startCount);
+        long travelledLeft  = abs(encoderCountLeft  - startLeft);
+        long travelledRight = abs(encoderCountRight - startRight);
         interrupts();
-        if (travelled >= targetCounts) break;
+        // Stop when either side reaches the target (prevents over-driving)
+        if (travelledLeft >= targetCounts || travelledRight >= targetCounts) break;
 
         // Check ground sensor (down normally, up when flipped) — abort if ground disappears
         if (readGroundSensor() > CLIFF_THRESHOLD_CM) {
@@ -345,26 +368,35 @@ void handleMotor(int direction, float distanceCm, float speed) {
     stopMotors();
 
     noInterrupts();
-    long actualCounts = abs(encoderCount - startCount);
+    long actualLeft  = abs(encoderCountLeft  - startLeft);
+    long actualRight = abs(encoderCountRight - startRight);
     interrupts();
 
-    float actualCm = (float)actualCounts / COUNTS_PER_REV * DIST_PER_REV_CM;
+    float leftCm  = (float)actualLeft  / COUNTS_PER_REV * DIST_PER_REV_CM;
+    float rightCm = (float)actualRight / COUNTS_PER_REV * DIST_PER_REV_CM;
 
     if (cliffDetected) {
-        // Send partial distance covered; Pi will handle cliff response
+        // Send partial distances from both sides; Pi will handle cliff response
         Serial.print("CLIFF:");
-        Serial.println(actualCm);
+        Serial.print(leftCm);
+        Serial.print(",");
+        Serial.println(rightCm);
         return;
     }
 
-    // Normal completion — report distance and slip ratio
+    // Normal completion — report both distances and per-side slip ratios
     // error > 1.0 → wheels spun more than expected (slipping)
     // error < 1.0 → fewer counts than expected (stalled or very slow)
-    float errorRatio = (targetCounts > 0) ? (float)actualCounts / (float)targetCounts : 1.0f;
+    float leftRatio  = (targetCounts > 0) ? (float)actualLeft  / (float)targetCounts : 1.0f;
+    float rightRatio = (targetCounts > 0) ? (float)actualRight / (float)targetCounts : 1.0f;
     Serial.print("DONE:");
-    Serial.print(actualCm);
+    Serial.print(leftCm);
     Serial.print(",");
-    Serial.println(errorRatio, 4);
+    Serial.print(rightCm);
+    Serial.print(",");
+    Serial.print(leftRatio, 4);
+    Serial.print(",");
+    Serial.println(rightRatio, 4);
 }
 
 void handleSweep(float amount, float speed) {
@@ -372,15 +404,20 @@ void handleSweep(float amount, float speed) {
 }
 
 void handleQuery() {
-    // Atomically snapshot and reset the encoder counter
+    // Atomically snapshot and reset both encoder counters
     noInterrupts();
-    long count = encoderCount;
-    encoderCount = 0;
+    long countLeft  = encoderCountLeft;
+    long countRight = encoderCountRight;
+    encoderCountLeft  = 0;
+    encoderCountRight = 0;
     interrupts();
 
-    float distanceCm = (float)count / COUNTS_PER_REV * DIST_PER_REV_CM;
+    float leftCm  = (float)countLeft  / COUNTS_PER_REV * DIST_PER_REV_CM;
+    float rightCm = (float)countRight / COUNTS_PER_REV * DIST_PER_REV_CM;
     Serial.print("DIST:");
-    Serial.println(distanceCm);
+    Serial.print(leftCm);
+    Serial.print(",");
+    Serial.println(rightCm);
 }
 
 void handleFlip(float amount) {
@@ -411,10 +448,17 @@ void setup() {
     pinMode(PIN_ULTRA_UP_TRIG,   OUTPUT);
     pinMode(PIN_ULTRA_UP_ECHO,   INPUT);
 
-    // Encoder
-    pinMode(ENCODER_A, INPUT_PULLUP);
-    pinMode(ENCODER_B, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(ENCODER_A), encoderISR, RISING);
+    // Left encoder — hardware interrupt
+    pinMode(ENCODER_A_LEFT,  INPUT_PULLUP);
+    pinMode(ENCODER_B_LEFT,  INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_A_LEFT), encoderISR_Left, RISING);
+
+    // Right encoder — pin-change interrupt on PORTB (PCINT0_vect)
+    pinMode(ENCODER_A_RIGHT, INPUT_PULLUP);
+    pinMode(ENCODER_B_RIGHT, INPUT_PULLUP);
+    lastPORTB = PINB;
+    PCICR  |= (1 << PCIE0);   // enable PCINT0..7 (PORTB)
+    PCMSK0 |= (1 << PCINT2);  // unmask PB2 = pin 10 = ENCODER_A_RIGHT
 
     tiltServo.attach(PIN_TILT);
     tiltServo.write(90);  // center

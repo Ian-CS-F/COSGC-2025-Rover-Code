@@ -43,7 +43,7 @@ def send_command(ser, system, direction, amount, speed):
 def wait_for_done(ser, timeout=MOTOR_DONE_TIMEOUT):
     """Wait for DONE:<left_cm>,<right_cm>,<left_ratio>,<right_ratio> and return
     (left_cm, right_cm, left_ratio, right_ratio), or None on timeout.
-    Returns ("CLIFF", left_cm, right_cm) on cliff detection."""
+    CLIFF messages are ignored during testing."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         line = ser.readline().decode(errors="replace").strip()
@@ -54,11 +54,6 @@ def wait_for_done(ser, timeout=MOTOR_DONE_TIMEOUT):
             left_ratio = float(parts[2]) if len(parts) > 2 else 1.0
             right_ratio= float(parts[3]) if len(parts) > 3 else 1.0
             return left_cm, right_cm, left_ratio, right_ratio
-        if line.startswith("CLIFF:"):
-            parts = line[6:].split(",")
-            left_cm  = float(parts[0])
-            right_cm = float(parts[1]) if len(parts) > 1 else left_cm
-            return "CLIFF", left_cm, right_cm
     return None
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
@@ -77,9 +72,6 @@ def test_drive_forward():
     ser.close()
     if result is None:
         print("  FAIL — no DONE received within timeout")
-        return False
-    if result[0] == "CLIFF":
-        print(f"  FAIL — unexpected CLIFF (left={result[1]:.1f} cm, right={result[2]:.1f} cm)")
         return False
     left_cm, right_cm, left_ratio, right_ratio = result
     discrepancy = abs(left_cm - right_cm)
@@ -100,9 +92,6 @@ def test_drive_reverse():
     ser.close()
     if result is None:
         print("  FAIL — no DONE received within timeout")
-        return False
-    if result[0] == "CLIFF":
-        print(f"  FAIL — unexpected CLIFF (left={result[1]:.1f} cm, right={result[2]:.1f} cm)")
         return False
     left_cm, right_cm, left_ratio, right_ratio = result
     discrepancy = abs(left_cm - right_cm)

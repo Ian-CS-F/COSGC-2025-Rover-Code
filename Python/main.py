@@ -21,9 +21,9 @@ Speed:
 Motor distance protocol:
     Pi sends      (1, <dir>, <distance_cm>, <speed>)
     Arduino drives until encoder reaches target, then stops
-    Arduino sends "DONE:<actual_cm>,<error_ratio>"
-      actual_cm   — encoder-measured distance covered
-      error_ratio — actual_counts / target_counts
+    Arduino sends "DONE:<left_cm>,<right_cm>,<left_ratio>,<right_ratio>"
+      left_cm/right_cm     — encoder-measured distance per side
+      left_ratio/right_ratio — actual_counts / target_counts per side
                     > 1.0 : wheels spun more than expected (slipping)
                     < 1.0 : fewer counts than expected (stalled / very slow)
     (amount == 0 → continuous drive; no DONE sent)
@@ -35,15 +35,14 @@ Sweep protocol:
     Arduino sends "SWEEP_DONE"                  when back at centre
 
 Arduino → Pi:
-    READY              sent on boot (every second until ACK received)
-    DONE:<cm>,<ratio>  drive segment complete; encoder distance + slip ratio
-    CLIFF:<cm>         ground lost mid-drive (motors already stopped);
-                       cm = partial encoder distance covered before stop.
-                       No DONE is sent for that segment.
-                       Also sent at 1 Hz while idle if ground is lost.
-    AT:h,t             current horizontal and tilt angles during a sweep
-    SWEEP_DONE         sweep complete, rover back at heading 0
-    DIST:<cm>          response to Query command (distance since last query)
+    READY                                    sent on boot (every second until ACK received)
+    DONE:<left_cm>,<right_cm>,<lr>,<rr>     drive segment complete; per-side distance + slip
+    CLIFF:<left_cm>,<right_cm>              ground lost mid-drive (motors already stopped);
+                                             No DONE is sent for that segment.
+                                             Also sent at 1 Hz while idle if ground is lost.
+    AT:h,t                                   current horizontal and tilt angles during a sweep
+    SWEEP_DONE                               sweep complete, rover back at heading 0
+    DIST:<left_cm>,<right_cm>               response to Query command (distance since last query)
 """
 
 import math
@@ -62,7 +61,7 @@ from astar import AStar          # type: ignore
 class CliffDetected(Exception):
     """Raised when the Arduino reports a cliff mid-drive."""
     def __init__(self, partial_cm: float) -> None:
-        self.partial_cm = partial_cm  # encoder distance covered before stop
+        self.partial_cm = partial_cm  # average encoder distance covered before stop
 
 # ── Serial ────────────────────────────────────────────────────────────────────
 SERIAL_PORT       = "/dev/ttyACM0"
@@ -74,11 +73,14 @@ SERVO, MOTOR, SWEEP, QUERY, FLIP = 0, 1, 2, 3, 4
 LEFT, RIGHT, UP, DOWN = 0, 1, 2, 3
 
 # ── LIDAR (Garmin LIDAR-Lite v4 LED) ─────────────────────────────────────────
-LIDAR_ADDR = 0x62
-I2C_BUS    = 1
+LIDAR_ADDR_1 = 0x5b   # LIDAR #1 pre-configured address
+LIDAR_ADDR_2 = 0x62   # LIDAR #2 pre-configured address
+I2C_BUS      = 1
+
+_LIDAR_TOLERANCE_CM = 10  # max divergence before using closer reading
 
 # ── IMU (ICM-20948) ───────────────────────────────────────────────────────────
-ICM_ADDR     = 0x68   # use 0x69 if AD0 is pulled high
+ICM_ADDR     = 0x69   # AD0 pulled high
 REG_BANK_SEL = 0x7F   # write (bank << 4) to select register bank
 
 # Bank 0
@@ -229,13 +231,32 @@ def read_pitch(bus: smbus2.SMBus) -> float:
 
 
 # ── LIDAR ─────────────────────────────────────────────────────────────────────
+def _read_one_lidar(bus: smbus2.SMBus, addr: int) -> float | None:
+    """Trigger and read one LIDAR-Lite v4. Returns metres or None on error."""
+    try:
+        bus.write_byte_data(addr, 0x00, 0x04)
+        time.sleep(0.02)
+        high = bus.read_byte_data(addr, 0x0f)
+        low  = bus.read_byte_data(addr, 0x10)
+        return ((high << 8) | low) / 100.0
+    except OSError:
+        return None
+
+
 def read_lidar(bus: smbus2.SMBus) -> float:
-    """Trigger a measurement and return distance in metres."""
-    bus.write_byte_data(LIDAR_ADDR, 0x00, 0x04)  # trigger
-    time.sleep(0.02)                               # ~20 ms measurement time
-    high = bus.read_byte_data(LIDAR_ADDR, 0x0f)
-    low  = bus.read_byte_data(LIDAR_ADDR, 0x10)
-    return ((high << 8) | low) / 100.0            # cm → m
+    """Read both LIDARs and return averaged distance in metres.
+    Falls back to the closer reading if they diverge, or 2.0 m on total failure."""
+    d1 = _read_one_lidar(bus, LIDAR_ADDR_1)
+    d2 = _read_one_lidar(bus, LIDAR_ADDR_2)
+    if d1 is None and d2 is None:
+        return 2.0
+    if d1 is None:
+        return d2
+    if d2 is None:
+        return d1
+    if abs(d1 - d2) * 100 <= _LIDAR_TOLERANCE_CM:
+        return (d1 + d2) / 2.0
+    return min(d1, d2)
 
 
 # ── Motor PID constants ───────────────────────────────────────────────────────
@@ -269,12 +290,21 @@ def drive_segment(
     while time.monotonic() < deadline:
         line = ser.readline().decode(errors="replace").strip()
         if line.startswith("DONE:"):
+            # DONE:<left_cm>,<right_cm>,<left_ratio>,<right_ratio>
             parts = line[5:].split(",")
-            actual_cm   = float(parts[0])
-            error_ratio = float(parts[1]) if len(parts) > 1 else 1.0
+            left_cm    = float(parts[0])
+            right_cm   = float(parts[1]) if len(parts) > 1 else left_cm
+            left_ratio = float(parts[2]) if len(parts) > 2 else 1.0
+            right_ratio= float(parts[3]) if len(parts) > 3 else 1.0
+            actual_cm   = (left_cm + right_cm) / 2.0
+            error_ratio = (left_ratio + right_ratio) / 2.0
             return actual_cm, error_ratio
         if line.startswith("CLIFF:"):
-            raise CliffDetected(float(line[6:]))
+            # CLIFF:<left_cm>,<right_cm>
+            parts = line[6:].split(",")
+            left_cm  = float(parts[0])
+            right_cm = float(parts[1]) if len(parts) > 1 else left_cm
+            raise CliffDetected((left_cm + right_cm) / 2.0)
     return 0.0, 0.0
 
 
@@ -354,7 +384,11 @@ def query_distance(ser: serial.Serial) -> float:
     while time.monotonic() < deadline:
         line = ser.readline().decode(errors="replace").strip()
         if line.startswith("DIST:"):
-            return float(line[5:])
+            # DIST:<left_cm>,<right_cm>
+            parts = line[5:].split(",")
+            left_cm  = float(parts[0])
+            right_cm = float(parts[1]) if len(parts) > 1 else left_cm
+            return (left_cm + right_cm) / 2.0
     return 0.0
 
 

@@ -2,10 +2,10 @@
 computer_main.py
 Runs all rover navigation logic on a laptop/desktop instead of a Raspberry Pi.
 
-Hardware setup (two USB connections to the computer):
-    Motor Arduino  → MOTOR_PORT   (runs Arduino/rover_interpreter.ino)
-    Sensor Arduino → SENSOR_PORT  (runs Arduino/i2c_bridge/i2c_bridge.ino)
-                     Has ICM-20948 (0x69) and LIDAR-Lite v4 (0x62) on I2C
+Hardware setup:
+    Motor Arduino → MOTOR_PORT  (runs Arduino/rover_interpreter.ino)
+    IMU + LIDARs  → Raspberry Pi I2C bus 1 (GPIO 2/3) — read directly via smbus2
+                    ICM-20948 @ 0x68, LIDAR-Lite v4 #1 @ 0x64, #2 @ 0x62
 
 Set HARDWARE_MODE = False to run with no hardware at all — all sensors are
 mocked so the navigation logic can be tested on any machine.
@@ -30,7 +30,6 @@ import threading
 # ── Configuration — edit these for your machine ───────────────────────────────
 HARDWARE_MODE = True          # False = mock sensors, no hardware required
 MOTOR_PORT    = "/dev/ttyUSB0"   # port for the motor/encoder Arduino
-SENSOR_PORT   = "/dev/ttyUSB1"   # port for the i2c_bridge Arduino
 BAUD_RATE     = 9600
 
 # ── Path setup — finds nav modules relative to this file ─────────────────────
@@ -85,8 +84,8 @@ if HARDWARE_MODE:
     import sensor_bridge  # type: ignore
 
     def _connect_sensors():
-        print(f"Connecting to sensor bridge on {SENSOR_PORT}...")
-        sensor_bridge.connect(SENSOR_PORT, BAUD_RATE)
+        print("Connecting to sensors via I2C...")
+        sensor_bridge.connect()
         if not sensor_bridge.is_imu_ok():
             print("WARNING: IMU not responding — check wiring and i2c_bridge firmware")
         if not sensor_bridge.is_lidar_ok():
@@ -187,12 +186,19 @@ def drive_segment(ser, direction: int, distance_cm: float, speed: float) -> tupl
     while time.monotonic() < deadline:
         line = ser.readline().decode(errors="replace").strip()
         if line.startswith("DONE:"):
+            # DONE:<left_cm>,<right_cm>,<left_ratio>,<right_ratio>
             parts = line[5:].split(",")
-            actual_cm   = float(parts[0])
-            error_ratio = float(parts[1]) if len(parts) > 1 else 1.0
-            return actual_cm, error_ratio
+            left_cm     = float(parts[0])
+            right_cm    = float(parts[1]) if len(parts) > 1 else left_cm
+            left_ratio  = float(parts[2]) if len(parts) > 2 else 1.0
+            right_ratio = float(parts[3]) if len(parts) > 3 else 1.0
+            return (left_cm + right_cm) / 2.0, (left_ratio + right_ratio) / 2.0
         if line.startswith("CLIFF:"):
-            raise CliffDetected(float(line[6:]))
+            # CLIFF:<left_cm>,<right_cm>
+            parts = line[6:].split(",")
+            left_cm  = float(parts[0])
+            right_cm = float(parts[1]) if len(parts) > 1 else left_cm
+            raise CliffDetected((left_cm + right_cm) / 2.0)
     return 0.0, 0.0   # timeout
 
 
@@ -240,7 +246,11 @@ def query_distance(ser) -> float:
     while time.monotonic() < deadline:
         line = ser.readline().decode(errors="replace").strip()
         if line.startswith("DIST:"):
-            return float(line[5:])
+            # DIST:<left_cm>,<right_cm>
+            parts = line[5:].split(",")
+            left_cm  = float(parts[0])
+            right_cm = float(parts[1]) if len(parts) > 1 else left_cm
+            return (left_cm + right_cm) / 2.0
     return 0.0
 
 
@@ -569,7 +579,7 @@ if __name__ == "__main__":
                 print(f"  [MOTOR CMD] {data.decode().strip()}")
             def readline(self):
                 time.sleep(0.05)
-                return b"DONE:10.0,1.0\n"
+                return b"DONE:10.0,10.0,1.0,1.0\n"
             @property
             def in_waiting(self):
                 return 0

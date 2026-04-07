@@ -21,7 +21,7 @@
 #include <Wire.h>
 
 // ── Addresses ─────────────────────────────────────────────────────────────────
-#define ICM_ADDR   0x69   // AD0 pulled HIGH
+#define ICM_ADDR   0x69   // AD0 pulled HIGH — confirmed
 #define MAG_ADDR   0x0C   // AK09916 magnetometer (exposed via bypass mode)
 #define LIDAR_ADDR 0x62
 

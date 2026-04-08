@@ -18,7 +18,7 @@ import time
 import serial
 
 # ── Constants from main.py ────────────────────────────────────────────────────
-SERIAL_PORT        = "/dev/ttyUSB0"
+SERIAL_PORT        = "/dev/ttyACM0"
 BAUD_RATE          = 9600
 HANDSHAKE_TIMEOUT  = 10
 MOTOR_DONE_TIMEOUT = 30.0

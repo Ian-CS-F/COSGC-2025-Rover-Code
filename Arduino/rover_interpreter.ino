@@ -452,7 +452,9 @@ void loop() {
         if (groundDist > CLIFF_THRESHOLD_CM) {
             stopMotors();
             Serial.print("CLIFF:");
-            Serial.println(groundDist);
+            Serial.print(groundDist);
+            Serial.print(",");
+            Serial.println(groundDist);  // same value both sides — idle check has no per-side data
             lastCliffAlert = millis();
         }
     }

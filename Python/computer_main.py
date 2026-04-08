@@ -29,7 +29,7 @@ import threading
 
 # ── Configuration — edit these for your machine ───────────────────────────────
 HARDWARE_MODE = True          # False = mock sensors, no hardware required
-MOTOR_PORT    = "/dev/ttyUSB0"   # port for the motor/encoder Arduino
+MOTOR_PORT    = "/dev/ttyACM0"   # port for the motor/encoder Arduino
 BAUD_RATE     = 9600
 
 # ── Path setup — finds nav modules relative to this file ─────────────────────

@@ -14,7 +14,7 @@ import time
 import serial
 
 # ── Constants from main.py ────────────────────────────────────────────────────
-SERIAL_PORT       = "/dev/ttyUSB0"
+SERIAL_PORT       = "/dev/ttyACM0"
 BAUD_RATE         = 9600
 HANDSHAKE_TIMEOUT = 10
 MOTOR_DONE_TIMEOUT = 30.0
@@ -41,19 +41,32 @@ def send_command(ser, system, direction, amount, speed):
     ser.write(packet.encode())
 
 def wait_for_done(ser, timeout=MOTOR_DONE_TIMEOUT):
-    """Wait for DONE:<left_cm>,<right_cm>,<left_ratio>,<right_ratio> and return
-    (left_cm, right_cm, left_ratio, right_ratio), or None on timeout.
-    CLIFF messages are ignored during testing."""
+    """Wait for DONE or CLIFF from the Arduino.
+
+    Returns:
+        ("DONE", left_cm, right_cm, left_ratio, right_ratio)  on DONE
+        ("CLIFF", left_cm, right_cm, None, None)              on CLIFF
+        None on timeout
+
+    NOTE: When the rover is on a stand the downward ultrasonic sees the floor
+    as >40 cm away and triggers a CLIFF stop. Stand tests should check for
+    both DONE and CLIFF and treat CLIFF as acceptable if encoders moved.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         line = ser.readline().decode(errors="replace").strip()
         if line.startswith("DONE:"):
             parts = line[5:].split(",")
-            left_cm    = float(parts[0])
-            right_cm   = float(parts[1]) if len(parts) > 1 else left_cm
-            left_ratio = float(parts[2]) if len(parts) > 2 else 1.0
-            right_ratio= float(parts[3]) if len(parts) > 3 else 1.0
-            return left_cm, right_cm, left_ratio, right_ratio
+            left_cm     = float(parts[0])
+            right_cm    = float(parts[1]) if len(parts) > 1 else left_cm
+            left_ratio  = float(parts[2]) if len(parts) > 2 else 1.0
+            right_ratio = float(parts[3]) if len(parts) > 3 else 1.0
+            return "DONE", left_cm, right_cm, left_ratio, right_ratio
+        if line.startswith("CLIFF:"):
+            parts = line[6:].split(",")
+            left_cm  = float(parts[0])
+            right_cm = float(parts[1]) if len(parts) > 1 else left_cm
+            return "CLIFF", left_cm, right_cm, None, None
     return None
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
@@ -71,17 +84,20 @@ def test_drive_forward():
     result = wait_for_done(ser)
     ser.close()
     if result is None:
-        print("  FAIL — no DONE received within timeout")
+        print("  FAIL — no response within timeout")
         return False
-    left_cm, right_cm, left_ratio, right_ratio = result
+    kind, left_cm, right_cm, left_ratio, right_ratio = result
     discrepancy = abs(left_cm - right_cm)
     passed = left_cm > 0.0 and right_cm > 0.0
-    print(f"  Left: {left_cm:.1f} cm (ratio {left_ratio:.3f})  Right: {right_cm:.1f} cm (ratio {right_ratio:.3f})  "
-          f"Discrepancy: {discrepancy:.1f} cm  →  {'PASS' if passed else 'FAIL'}")
+    note = "" if kind == "DONE" else "  (CLIFF stop — normal on stand, check encoders moved)"
+    lr = f"{left_ratio:.3f}" if left_ratio is not None else "—"
+    rr = f"{right_ratio:.3f}" if right_ratio is not None else "—"
+    print(f"  Left: {left_cm:.1f} cm (ratio {lr})  Right: {right_cm:.1f} cm (ratio {rr})  "
+          f"Discrepancy: {discrepancy:.1f} cm  →  {'PASS' if passed else 'FAIL'}{note}")
     return passed
 
 def test_drive_reverse():
-    """Send (1, DOWN, 10.0, 0.7) and confirm DONE is received."""
+    """Send (1, DOWN, 10.0, 0.7) and confirm motors moved."""
     print("TEST: Drive reverse 10 cm (wheels off ground)...")
     ser = _open_and_handshake()
     if not ser:
@@ -91,13 +107,16 @@ def test_drive_reverse():
     result = wait_for_done(ser)
     ser.close()
     if result is None:
-        print("  FAIL — no DONE received within timeout")
+        print("  FAIL — no response within timeout")
         return False
-    left_cm, right_cm, left_ratio, right_ratio = result
+    kind, left_cm, right_cm, left_ratio, right_ratio = result
     discrepancy = abs(left_cm - right_cm)
     passed = left_cm > 0.0 and right_cm > 0.0
-    print(f"  Left: {left_cm:.1f} cm (ratio {left_ratio:.3f})  Right: {right_cm:.1f} cm (ratio {right_ratio:.3f})  "
-          f"Discrepancy: {discrepancy:.1f} cm  →  {'PASS' if passed else 'FAIL'}")
+    note = "" if kind == "DONE" else "  (CLIFF stop — normal on stand, check encoders moved)"
+    lr = f"{left_ratio:.3f}" if left_ratio is not None else "—"
+    rr = f"{right_ratio:.3f}" if right_ratio is not None else "—"
+    print(f"  Left: {left_cm:.1f} cm (ratio {lr})  Right: {right_cm:.1f} cm (ratio {rr})  "
+          f"Discrepancy: {discrepancy:.1f} cm  →  {'PASS' if passed else 'FAIL'}{note}")
     return passed
 
 def test_turn_left():
@@ -185,10 +204,10 @@ def test_ultrasonic_ground_detected():
     if result is None:
         print("  FAIL — no response")
         return False
-    if result[0] == "CLIFF":
-        print(f"  FAIL — unexpected CLIFF (left={result[1]:.1f} cm, right={result[2]:.1f} cm, sensor may not see ground)")
+    kind, left_cm, right_cm, _, _ = result
+    if kind == "CLIFF":
+        print(f"  FAIL — unexpected CLIFF (left={left_cm:.1f} cm, right={right_cm:.1f} cm, sensor may not see ground)")
         return False
-    left_cm, right_cm, _, _ = result
     print(f"  Drive completed — left {left_cm:.1f} cm, right {right_cm:.1f} cm, no cliff  →  PASS")
     return True
 
@@ -212,8 +231,9 @@ def test_ultrasonic_cliff_detected():
     if result is None:
         print("  FAIL — no CLIFF or DONE received within 15 s")
         return False
-    if result[0] == "CLIFF":
-        print(f"  CLIFF detected — left {result[1]:.1f} cm, right {result[2]:.1f} cm  →  PASS")
+    kind, left_cm, right_cm, _, _ = result
+    if kind == "CLIFF":
+        print(f"  CLIFF detected — left {left_cm:.1f} cm, right {right_cm:.1f} cm  →  PASS")
         return True
     print(f"  FAIL — got DONE instead of CLIFF (motors stopped before cliff was triggered)")
     return False

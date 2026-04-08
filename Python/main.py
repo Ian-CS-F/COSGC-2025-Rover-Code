@@ -103,6 +103,23 @@ _flipped: bool = False  # tracks current flip state; updated by check_and_update
 CLIFF_DROP_CM      = 5     # cliff cell is marked this many cm below current cell
 PITCH_UP_THRESHOLD = 30.0  # degrees — above this, cliff alert is a normal slope
 
+# ── Phase control ─────────────────────────────────────────────────────────────
+# Set each flag to True to enable that phase.  Enabled phases run in order
+# (1 → 2 → 3).  Disable a phase to skip it entirely.
+PHASE_1_ENABLED = True   # simple forward drive (encoder-only, no heading correction)
+PHASE_2_ENABLED = False   # heading-hold drive   (IMU-corrected straight line)
+PHASE_3_ENABLED = False   # full A* navigation   (sweep + path planning)
+
+# ── Phase 1 constants ─────────────────────────────────────────────────────────
+PHASE_1_DISTANCE_CM = 200.0  # total forward distance to drive in phase 1
+
+# ── Phase 2 constants ─────────────────────────────────────────────────────────
+PHASE_2_DISTANCE_CM   = 300.0  # total forward distance to cover in phase 2
+PHASE_2_SEGMENT_CM    = 30.0   # drive in short bursts, then re-check heading
+PHASE_2_TARGET_HEADING: float | None = None
+# None → use the heading read at startup as the target (drive straight ahead).
+# Set to a fixed value (e.g. 90.0) to drive toward a specific compass bearing.
+
 # ── Map configuration ─────────────────────────────────────────────────────────
 MAP_WIDTH_M  = 3.0   # physical width  in metres
 MAP_HEIGHT_M = 8.0   # physical height in metres
@@ -602,6 +619,97 @@ def follow_path(
     return x, y
 
 
+# ── Path visualisation ───────────────────────────────────────────────────────
+def print_path_grid(
+    heightmap: Heightmap,
+    planner: AStar,
+    path: list[tuple[int, int]],
+    rover_pos: tuple[int, int],
+    goal: tuple[int, int],
+    max_display_rows: int = 30,
+    max_display_cols: int = 40,
+) -> None:
+    """
+    Print the planned path overlaid on the traversability map.
+
+    Each terminal cell is 2 characters wide and represents one or more grid
+    cells (when the map is larger than the terminal window, the grid is
+    downsampled by integer strides; the highest-priority symbol wins per block).
+
+    Symbol legend:
+        RR  rover's current grid position
+        GG  goal position
+        ██  cell on the planned path (walkable)
+        ░░  obstacle — height diff to a neighbour exceeds max_height_diff
+        ··  open traversable cell not currently on the path
+
+    Priority (highest wins when multiple cells are merged into one display cell):
+        rover > goal > path cell > obstacle > open space
+    """
+    rows, cols = heightmap.rows, heightmap.cols
+
+    # Integer strides so the display fits within the requested terminal size
+    row_stride = max(1, math.ceil(rows / max_display_rows))
+    col_stride = max(1, math.ceil(cols / max_display_cols))
+
+    display_rows = math.ceil(rows / row_stride)
+    display_cols = math.ceil(cols / col_stride)
+
+    path_set = set(path)
+
+    def _is_obstacle(r: int, c: int) -> bool:
+        """True when any cardinal neighbour's height diff exceeds max_height_diff."""
+        h = heightmap.heights[r][c]
+        for dr2, dc2 in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nr, nc = r + dr2, c + dc2
+            if 0 <= nr < rows and 0 <= nc < cols:
+                if abs(heightmap.heights[nr][nc] - h) > planner.max_height_diff:
+                    return True
+        return False
+
+    # Priority values used for downsampled block merging
+    _PRI = {"RR": 4, "GG": 3, "██": 2, "░░": 1, "··": 0}
+
+    print(
+        f"\n  Path grid  map {rows}r×{cols}c → display {display_rows}×{display_cols}"
+        f"  (stride {row_stride}r×{col_stride}c)"
+    )
+    print("  RR=rover  GG=goal  ██=path  ░░=obstacle  ··=open\n")
+
+    # Top border
+    print("  ┌" + "──" * display_cols + "┐")
+
+    for dr in range(display_rows):
+        line = "  │"
+        for dc in range(display_cols):
+            # Collect all actual cells that map into this display block
+            best = "··"
+            for br in range(dr * row_stride, min((dr + 1) * row_stride, rows)):
+                for bc in range(dc * col_stride, min((dc + 1) * col_stride, cols)):
+                    pos = (br, bc)
+                    if pos == rover_pos:
+                        sym = "RR"
+                    elif pos == goal:
+                        sym = "GG"
+                    elif pos in path_set:
+                        sym = "██"
+                    elif _is_obstacle(br, bc):
+                        sym = "░░"
+                    else:
+                        sym = "··"
+                    if _PRI[sym] > _PRI[best]:
+                        best = sym
+                    if best == "RR":
+                        break  # can't improve further
+                if best == "RR":
+                    break
+            line += best
+        print(line + "│")
+
+    # Bottom border
+    print("  └" + "──" * display_cols + "┘\n")
+
+
 # ── Straight-line fallback ────────────────────────────────────────────────────
 def drive_straight_toward_goal(
     ser: serial.Serial,
@@ -663,6 +771,139 @@ def drive_straight_toward_goal(
     return x, y, None  # STRAIGHT_MAX_SEGMENTS exhausted without finding a path
 
 
+# ── Phase 1: Simple forward drive ────────────────────────────────────────────
+def phase1_drive(ser: serial.Serial, bus: smbus2.SMBus) -> None:
+    """
+    Drive straight forward for PHASE_1_DISTANCE_CM using encoder feedback only.
+    No IMU heading correction is applied — the rover relies purely on the motor
+    encoder slip-compensation loop in move_rover().
+    """
+    print(f"[Phase 1] Driving {PHASE_1_DISTANCE_CM:.0f} cm forward (encoder only)…")
+    try:
+        covered = move_rover(ser, UP, PHASE_1_DISTANCE_CM)
+        print(f"[Phase 1] Covered {covered:.1f} cm — done")
+    except CliffDetected as e:
+        print(f"[Phase 1] Cliff detected after {e.partial_cm:.1f} cm — phase 1 ended early")
+
+
+# ── Phase 2: Heading-hold drive ───────────────────────────────────────────────
+def phase2_heading_follow(
+    ser: serial.Serial,
+    bus: smbus2.SMBus,
+    initial_heading: float,
+) -> None:
+    """
+    Drive PHASE_2_DISTANCE_CM while continuously correcting to a target heading.
+
+    The rover drives in short PHASE_2_SEGMENT_CM bursts.  Between each burst it
+    reads the IMU and turns back to the target heading if it has drifted outside
+    TURN_TOLERANCE_DEG.
+
+    PHASE_2_TARGET_HEADING controls which bearing to hold:
+        None  → use initial_heading (drive straight ahead from startup)
+        float → drive toward that fixed compass bearing (e.g. 90.0 = East)
+    """
+    target = PHASE_2_TARGET_HEADING if PHASE_2_TARGET_HEADING is not None else initial_heading
+    print(f"[Phase 2] Heading-hold drive — target {target:.1f}°, "
+          f"distance {PHASE_2_DISTANCE_CM:.0f} cm…")
+
+    remaining = PHASE_2_DISTANCE_CM
+    total_covered = 0.0
+
+    while remaining > 1.0:
+        check_and_update_flip(ser, bus)
+
+        # Re-align before each burst
+        turn_to_heading(ser, bus, target)
+
+        segment = min(PHASE_2_SEGMENT_CM, remaining)
+        try:
+            covered = move_rover(ser, UP, segment)
+        except CliffDetected as e:
+            total_covered += e.partial_cm
+            print(f"[Phase 2] Cliff detected after {total_covered:.1f} cm total — "
+                  "phase 2 ended early")
+            return
+
+        total_covered += covered
+        remaining     -= covered
+
+        # Stop if motor timed out (covered nothing)
+        if covered == 0.0:
+            print("[Phase 2] Motor timeout — stopping phase 2")
+            break
+
+    print(f"[Phase 2] Covered {total_covered:.1f} cm — done")
+
+
+# ── Phase 3: Full A* navigation ───────────────────────────────────────────────
+def phase3_full_nav(
+    ser: serial.Serial,
+    bus: smbus2.SMBus,
+    initial_heading: float,
+) -> None:
+    """
+    Full A*-guided navigation from the rover's current position to the goal cell.
+
+    Builds a heightmap via LIDAR sweeps, plans a path, and drives cell-by-cell
+    with periodic resweeps and replanning.  Falls back to straight-line driving
+    when A* cannot find a route.
+    """
+    print("[Phase 3] Full A* navigation…")
+
+    heightmap = Heightmap(ROWS, COLS)
+    planner   = AStar(heightmap, diagonal=True, turn_penalty=1.0, max_height_diff=2)
+
+    print(f"[Phase 3] Map: {ROWS} rows × {COLS} cols  ({RESOLUTION_M} m/cell)")
+
+    x, y = ROWS - 1, COLS // 2
+    goal  = (0, COLS // 2)
+
+    print("[Phase 3] Initial sensor sweep…")
+    sensor_sweep(ser, bus, heightmap, x, y, range_deg=90.0, step_ms=200.0)
+    heightmap.compute_slopes()
+
+    path = planner.find_path((x, y), goal)
+    if path is None:
+        print("[Phase 3] No initial path — driving straight toward goal…")
+        x, y, path = drive_straight_toward_goal(
+            ser, bus, heightmap, planner, x, y, initial_heading, goal
+        )
+        if path is None:
+            print("[Phase 3] Could not reach goal — stopped")
+            return
+
+    print(f"[Phase 3] Path found: {len(path)} cells  Goal: {goal}")
+    print_path_grid(heightmap, planner, path, (x, y), goal)
+
+    while True:
+        check_and_update_flip(ser, bus)
+
+        x, y = follow_path(ser, bus, heightmap, planner, path, x, y, initial_heading, goal)
+
+        if math.hypot(x - goal[0], y - goal[1]) <= GOAL_TOLERANCE_CELLS:
+            print(f"[Phase 3] Goal reached at ({x}, {y})")
+            break
+
+        print("[Phase 3] Path exhausted — 360° sweep and replan…")
+        sensor_sweep(ser, bus, heightmap, x, y, range_deg=360.0, step_ms=200.0)
+        heightmap.compute_slopes()
+        path = planner.find_path((x, y), goal)
+        if path is not None:
+            print(f"[Phase 3] Replanned: {len(path)} cells remaining")
+            print_path_grid(heightmap, planner, path, (x, y), goal)
+            continue
+
+        x, y, path = drive_straight_toward_goal(
+            ser, bus, heightmap, planner, x, y, initial_heading, goal
+        )
+        if path is None:
+            print("[Phase 3] No path after straight drive — stopped")
+            break
+        if path is not None:
+            print_path_grid(heightmap, planner, path, (x, y), goal)
+
+
 # ── Boot ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     ser = init_serial()
@@ -672,59 +913,25 @@ def main() -> None:
         initial_heading = read_heading(bus)
         print(f"Initial heading: {initial_heading:.1f}°")
 
-        heightmap = Heightmap(ROWS, COLS)
-        planner   = AStar(heightmap, diagonal=True, turn_penalty=1.0, max_height_diff=2)
+        enabled = [
+            ("Phase 1 — forward drive",    PHASE_1_ENABLED),
+            ("Phase 2 — heading-hold drive", PHASE_2_ENABLED),
+            ("Phase 3 — full A* nav",      PHASE_3_ENABLED),
+        ]
+        for label, flag in enabled:
+            print(f"  {'[ON] ' if flag else '[OFF]'} {label}")
+        print()
 
-        print(f"Map: {ROWS} rows × {COLS} cols  ({RESOLUTION_M} m/cell)")
+        if PHASE_1_ENABLED:
+            phase1_drive(ser, bus)
 
-        # Starting grid position — middle bottom (rover travels forward/up the grid)
-        x, y = ROWS - 1, COLS // 2
+        if PHASE_2_ENABLED:
+            phase2_heading_follow(ser, bus, initial_heading)
 
-        # Goal: middle of the far end of the course
-        goal = (0, COLS // 2)
+        if PHASE_3_ENABLED:
+            phase3_full_nav(ser, bus, initial_heading)
 
-        # Initial forward sweep to build the map before planning
-        print("Initial sensor sweep…")
-        sensor_sweep(ser, bus, heightmap, x, y, range_deg=90.0, step_ms=200.0)
-        heightmap.compute_slopes()
-
-        path = planner.find_path((x, y), goal)
-        if path is None:
-            print("No initial path to goal — driving straight toward goal…")
-            x, y, path = drive_straight_toward_goal(
-                ser, bus, heightmap, planner, x, y, initial_heading, goal
-            )
-            if path is None:
-                print("Could not reach goal — stopped")
-                return
-
-        print(f"Path found: {len(path)} cells  Goal: {goal}")
-
-        while True:
-            check_and_update_flip(ser, bus)
-
-            x, y = follow_path(ser, bus, heightmap, planner, path, x, y, initial_heading, goal)
-
-            if math.hypot(x - goal[0], y - goal[1]) <= GOAL_TOLERANCE_CELLS:
-                print(f"Goal reached at ({x}, {y})")
-                break
-
-            # Path exhausted without reaching goal — do a full sweep and replan
-            print("Path exhausted, doing 360° sweep and replanning…")
-            sensor_sweep(ser, bus, heightmap, x, y, range_deg=360.0, step_ms=200.0)
-            heightmap.compute_slopes()
-            path = planner.find_path((x, y), goal)
-            if path is not None:
-                print(f"Replanned: {len(path)} cells remaining")
-                continue
-
-            # Still no path after full sweep — drive straight toward goal
-            x, y, path = drive_straight_toward_goal(
-                ser, bus, heightmap, planner, x, y, initial_heading, goal
-            )
-            if path is None:
-                print("No path found after straight drive — stopped")
-                break
+        print("All enabled phases complete.")
     finally:
         ser.close()
         bus.close()

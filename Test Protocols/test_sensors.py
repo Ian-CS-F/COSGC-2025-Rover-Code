@@ -6,6 +6,13 @@ Streams live readings from each sensor for 10 seconds each.
   - Both LIDARs averaged
   - IMU accelerometer + gyroscope
   - IMU magnetometer + compass heading
+  - Ultrasonic down (cliff sensor, normal mode)
+  - Ultrasonic up  (cliff sensor, flipped mode)
+
+Ultrasonics are read by the Arduino Mega, not the Pi directly.
+The Arduino sends CLIFF:<left_cm>,<right_cm> unsolicited at 1 Hz when
+a sensor loses the ground. During the ultrasonic test you will be prompted
+to cover each sensor with your hand to trigger a CLIFF message.
 
 Run on the Pi:
     python3 "test_sensors.py"
@@ -15,6 +22,7 @@ import math
 import struct
 import time
 import smbus2
+import serial as pyserial
 
 # ── Config ────────────────────────────────────────────────────────────────────
 I2C_BUS      = 1
@@ -22,6 +30,9 @@ LIDAR_ADDR_1 = 0x5b
 LIDAR_ADDR_2 = 0x62
 ICM_ADDR     = 0x69
 MAG_ADDR     = 0x0C
+
+SERIAL_PORT  = "/dev/ttyACM0"  # Arduino Mega on Pi
+BAUD_RATE    = 9600
 
 TEST_DURATION = 10   # seconds per sensor block
 POLL_INTERVAL = 0.2  # seconds between readings
@@ -179,6 +190,145 @@ def test_imu_mag(bus):
     run_for(TEST_DURATION, "IMU — Magnetometer + Heading", _read)
 
 
+# ── Arduino serial helpers ────────────────────────────────────────────────────
+def connect_arduino():
+    """Open serial port and complete READY/ACK handshake. Returns Serial or None."""
+    try:
+        ser = pyserial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+        ser.reset_input_buffer()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            line = ser.readline().decode(errors="replace").strip()
+            if line == "READY":
+                ser.write(b"ACK\n")
+                print("  Arduino handshake OK")
+                return ser
+        print("  Arduino did not send READY within 10s")
+        return None
+    except pyserial.SerialException as e:
+        print(f"  Serial open failed: {e}")
+        return None
+
+
+def send_command(ser, system, direction, amount, speed):
+    ser.write(f"({system},{direction},{amount:.3f},{speed:.3f})\n".encode())
+
+
+def drain_lines(ser, timeout=0.05):
+    """Read and discard any pending lines."""
+    ser.timeout = timeout
+    while ser.readline():
+        pass
+    ser.timeout = 1
+
+
+# ── Arduino test blocks ───────────────────────────────────────────────────────
+def test_ultrasonic_down(ser):
+    """
+    Reads the downward cliff sensor by sending a QUERY and watching for CLIFF.
+    The Arduino sends CLIFF unsolicited at 1 Hz when the sensor loses the ground.
+    Prompt the user to cover the sensor to trigger a reading.
+    """
+    print(f"\n{'='*55}")
+    print(f"  Ultrasonic DOWN (cliff normal mode)  ({TEST_DURATION}s)")
+    print(f"{'='*55}")
+    print("  Point the rover so the DOWN sensor has a clear floor view.")
+    print("  Hold your hand ~50 cm above it to trigger a CLIFF reading.")
+
+    # Put rover in normal (non-flipped) mode
+    send_command(ser, 4, 0, 0.0, 0)  # FLIP off
+    drain_lines(ser)
+
+    deadline = time.monotonic() + TEST_DURATION
+    while time.monotonic() < deadline:
+        line = ser.readline().decode(errors="replace").strip()
+        if not line:
+            continue
+        if line.startswith("CLIFF:"):
+            parts = line[6:].split(",")
+            left_cm  = float(parts[0])
+            right_cm = float(parts[1]) if len(parts) > 1 else left_cm
+            print(f"  CLIFF detected  left={left_cm:.1f}cm  right={right_cm:.1f}cm")
+        else:
+            print(f"  [{line}]")
+
+
+def test_ultrasonic_up(ser):
+    """
+    Same as above but switches the rover to flipped mode so the Arduino
+    uses the upward sensor for cliff detection.
+    """
+    print(f"\n{'='*55}")
+    print(f"  Ultrasonic UP (cliff flipped mode)  ({TEST_DURATION}s)")
+    print(f"{'='*55}")
+    print("  The rover is now in FLIPPED mode — UP sensor is active.")
+    print("  Hold your hand above the UP sensor to trigger a CLIFF reading.")
+
+    send_command(ser, 4, 0, 1.0, 0)  # FLIP on
+    drain_lines(ser)
+
+    deadline = time.monotonic() + TEST_DURATION
+    while time.monotonic() < deadline:
+        line = ser.readline().decode(errors="replace").strip()
+        if not line:
+            continue
+        if line.startswith("CLIFF:"):
+            parts = line[6:].split(",")
+            left_cm  = float(parts[0])
+            right_cm = float(parts[1]) if len(parts) > 1 else left_cm
+            print(f"  CLIFF detected  left={left_cm:.1f}cm  right={right_cm:.1f}cm")
+        else:
+            print(f"  [{line}]")
+
+    # Restore normal mode
+    send_command(ser, 4, 0, 0.0, 0)
+
+
+def test_encoders(ser):
+    """
+    Spins each motor briefly at low speed then queries the encoder counts.
+    Tests left and right independently so you can verify each encoder fires.
+    """
+    print(f"\n{'='*55}")
+    print(f"  Encoders (left + right)")
+    print(f"{'='*55}")
+
+    DRIVE_SPEED = 0.4
+    DRIVE_CM    = 20.0
+    MOTOR, UP, DOWN, LEFT, RIGHT = 1, 2, 3, 0, 1
+
+    for label, direction in [("LEFT motor / LEFT encoder", LEFT),
+                              ("RIGHT motor / RIGHT encoder", RIGHT),
+                              ("BOTH forward", UP),
+                              ("BOTH reverse", DOWN)]:
+        print(f"\n  >> {label} ({DRIVE_CM:.0f} cm at speed {DRIVE_SPEED})")
+        drain_lines(ser)
+        send_command(ser, MOTOR, direction, DRIVE_CM, DRIVE_SPEED)
+
+        # Wait for DONE or timeout
+        deadline = time.monotonic() + 15
+        done = False
+        while time.monotonic() < deadline:
+            line = ser.readline().decode(errors="replace").strip()
+            if line.startswith("DONE:"):
+                parts = line[5:].split(",")
+                left_cm     = float(parts[0])
+                right_cm    = float(parts[1]) if len(parts) > 1 else left_cm
+                left_ratio  = float(parts[2]) if len(parts) > 2 else 1.0
+                right_ratio = float(parts[3]) if len(parts) > 3 else 1.0
+                print(f"     left={left_cm:.1f}cm (ratio={left_ratio:.3f})  "
+                      f"right={right_cm:.1f}cm (ratio={right_ratio:.3f})")
+                done = True
+                break
+            elif line.startswith("CLIFF:"):
+                print(f"     CLIFF mid-drive: {line}")
+                break
+        if not done:
+            print("     TIMEOUT — no DONE received")
+
+        time.sleep(0.5)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("Initialising I2C bus...")
@@ -199,5 +349,17 @@ if __name__ == "__main__":
         test_imu_mag(bus)
     finally:
         bus.close()
+
+    print("\nConnecting to Arduino for ultrasonic + encoder tests...")
+    ser = connect_arduino()
+    if ser:
+        try:
+            test_ultrasonic_down(ser)
+            test_ultrasonic_up(ser)
+            test_encoders(ser)
+        finally:
+            ser.close()
+    else:
+        print("Skipping Arduino tests — could not connect.")
 
     print("\nDone.")

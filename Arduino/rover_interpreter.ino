@@ -47,6 +47,12 @@
  *   Pi sends      (4, 0, 0.0, 0)  — return to normal mode
  *   When flipped: motor directions invert, ground ultrasonic switches to upward sensor
  *
+ * Drive protocol (independent per-side control):
+ *   Pi sends      (5, 0, <left_speed>, <right_speed>)
+ *   left_speed / right_speed: -1.0 (full reverse) to +1.0 (full forward)
+ *   Motors run continuously until the next command (no DONE sent).
+ *   Intended for direct/teleoperation use.
+ *
  * Handshake:
  *   Arduino sends  "READY"  every second until Pi replies "ACK"
  *
@@ -92,6 +98,7 @@
 #define SYS_SWEEP 2
 #define SYS_QUERY 3
 #define SYS_FLIP  4
+#define SYS_DRIVE 5  // independent per-side speed control
 
 #define COUNTS_PER_REV   64     // 64 P/R, 1x decoding (rising edge on A only)
 #define DIST_PER_REV_CM  10.0f  // cm per full encoder revolution — calibrate!
@@ -375,6 +382,21 @@ void handleFlip(float amount) {
     flipped = (amount >= 0.5f);
 }
 
+// Independent per-side speed control — amount = left speed, speed = right speed
+// Values in -1.0..+1.0; sign encodes direction, magnitude encodes PWM.
+void handleDrive(float leftSpeed, float rightSpeed) {
+    if (flipped) {
+        leftSpeed  = -leftSpeed;
+        rightSpeed = -rightSpeed;
+    }
+
+    int leftPwm  = constrain((int)(abs(leftSpeed)  * 255.0f), 0, 255);
+    int rightPwm = constrain((int)(abs(rightSpeed) * 255.0f), 0, 255);
+
+    setMotor(PIN_ENA, PIN_IN1, PIN_IN2, leftPwm,  leftSpeed  >= 0);
+    setMotor(PIN_ENB, PIN_IN3, PIN_IN4, rightPwm, rightSpeed >= 0);
+}
+
 void dispatch(const Command& cmd) {
     switch (cmd.system) {
         case SYS_SERVO: handleServo(cmd.direction, cmd.amount, cmd.speed); break;
@@ -382,6 +404,7 @@ void dispatch(const Command& cmd) {
         case SYS_SWEEP: handleSweep(cmd.amount, cmd.speed);                break;
         case SYS_QUERY: handleQuery();                                      break;
         case SYS_FLIP:  handleFlip(cmd.amount);                            break;
+        case SYS_DRIVE: handleDrive(cmd.amount, cmd.speed);                break;
     }
 }
 

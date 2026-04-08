@@ -57,3 +57,60 @@ def set_motors(ser: serial.Serial, left: float, right: float) -> None:
 
 def stop(ser: serial.Serial) -> None:
     set_motors(ser, 0.0, 0.0)
+
+
+if __name__ == "__main__":
+    import sys
+
+    port = sys.argv[1] if len(sys.argv) > 1 else SERIAL_PORT
+    print(f"Connecting on {port}...")
+    ser = connect(port)
+    print("Connected. Commands: w/s=forward/back, a/d=turn, space=stop, q=quit")
+    print("Speed up/down: +/-")
+
+    speed = 0.5
+
+    try:
+        import msvcrt  # Windows
+        def get_key():
+            return msvcrt.getch().decode(errors="replace").lower()
+    except ImportError:
+        import tty, termios  # Linux/Mac
+        def get_key():
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                return sys.stdin.read(1).lower()
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    try:
+        while True:
+            key = get_key()
+            if key == "w":
+                set_motors(ser, speed, speed)
+                print(f"Forward  {speed:.1f}")
+            elif key == "s":
+                set_motors(ser, -speed, -speed)
+                print(f"Reverse  {speed:.1f}")
+            elif key == "a":
+                set_motors(ser, -speed, speed)
+                print(f"Turn left  {speed:.1f}")
+            elif key == "d":
+                set_motors(ser, speed, -speed)
+                print(f"Turn right  {speed:.1f}")
+            elif key == " ":
+                stop(ser)
+                print("Stop")
+            elif key in ("+", "="):
+                speed = min(1.0, round(speed + 0.1, 1))
+                print(f"Speed → {speed:.1f}")
+            elif key == "-":
+                speed = max(0.1, round(speed - 0.1, 1))
+                print(f"Speed → {speed:.1f}")
+            elif key == "q":
+                break
+    finally:
+        disconnect(ser)
+        print("Disconnected.")

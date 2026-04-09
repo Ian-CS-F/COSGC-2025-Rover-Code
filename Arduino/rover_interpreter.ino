@@ -70,7 +70,7 @@
 #define PIN_IN3  8
 #define PIN_IN4  9
 
-#define PIN_TILT 11  // Camera tilt servo
+#define PIN_TILT 12  // Camera tilt servo
 
 // Downward-facing ultrasonic (HC-SR04) — cliff detection (normal mode)
 #define PIN_ULTRA_DOWN_TRIG A0
@@ -86,7 +86,7 @@
 
 // Right encoder — hardware interrupt INT1
 #define ENCODER_A_RIGHT 3   // INT1
-#define ENCODER_B_RIGHT 12  // direction read (any digital pin)
+#define ENCODER_B_RIGHT 11  // direction read (any digital pin)
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 #define BAUD_RATE 9600

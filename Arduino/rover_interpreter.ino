@@ -101,7 +101,7 @@
 #define SYS_DRIVE 5  // independent per-side speed control
 
 #define COUNTS_PER_REV   64     // 64 P/R, 1x decoding (rising edge on A only)
-#define DIST_PER_REV_CM  10.0f  // cm per full encoder revolution — calibrate!
+#define DIST_PER_REV_CM  35.2f  // cm per full encoder revolution — calibrate!
 
 #define DIR_LEFT  0
 #define DIR_RIGHT 1

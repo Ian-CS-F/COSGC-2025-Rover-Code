@@ -1,6 +1,6 @@
-# COSGC 2025 Rover
+# COSGC 2026 Rover
 
-Autonomous rover control system for the Colorado Space Grant Consortium 2025 competition.
+Autonomous rover control system for the Colorado Space Grant Consortium 2026 competition.
 The rover navigates an outdoor sand course, building a terrain heightmap with LIDAR and
 ultrasonics while planning a path with A* around obstacles and drop-offs.
 
@@ -25,7 +25,7 @@ ultrasonics while planning a path with A* around obstacles and drop-offs.
 ## Repository Layout
 
 ```
-COSGC-2025-Rover-Code/
+COSGC-2026-Rover-Code/
 ├── Arduino/
 │   └── rover_interpreeter.ino   # Arduino firmware
 └── Python/

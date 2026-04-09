@@ -1,0 +1,16 @@
+[Unit]
+Description=Shutdown button monitor (GPIO 17)
+After=multi-user.target
+# Does not depend on or conflict with the rover main.py service.
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/cosgc_26_rover/shutdown_button.py
+Restart=on-failure
+RestartSec=5
+User=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

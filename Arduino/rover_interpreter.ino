@@ -70,7 +70,9 @@
 #define PIN_IN3  8
 #define PIN_IN4  9
 
-#define PIN_TILT 12  // Camera tilt servo
+#define PIN_TILT  12  // Camera tilt servo (primary)
+#define PIN_TILT2 13  // Camera tilt servo (secondary — same axis, mirror-mounted)
+                      // Moves inverse of primary: if primary = angle, secondary = 180 - angle
 
 // Downward-facing ultrasonic (HC-SR04) — cliff detection (normal mode)
 #define PIN_ULTRA_DOWN_TRIG A0
@@ -144,7 +146,9 @@ void encoderISR_Right() {
 }
 
 // ── Servo / pan state ────────────────────────────────────────────────────────
-Servo tiltServo;
+Servo tiltServo;   // primary tilt servo  (PIN_TILT)
+Servo tiltServo2;  // secondary tilt servo (PIN_TILT2) — mirror-mounted on same axis
+                   // always commanded to (180 - angle) so both servos move in sync
 
 // Current pan angle in degrees (90 = centre / facing forward).
 // Updated every time handleServo moves the rover so incremental pan commands
@@ -229,6 +233,7 @@ void turnRight(float degrees) {
 // ── Sweep ─────────────────────────────────────────────────────────────────────
 void tiltStep(float hAngle, int tiltAngle, int stepMs) {
     tiltServo.write(tiltAngle);
+    tiltServo2.write(180 - tiltAngle);  // mirror
     Serial.print("AT:");
     Serial.print(hAngle);
     Serial.print(",");
@@ -264,6 +269,7 @@ void sweep(float range, int stepMs) {
     }
 
     tiltServo.write(90);
+    tiltServo2.write(90);   // 180 - 90 = 90, both centre
     turnLeft(halfRange);
     Serial.println("SWEEP_DONE");
 }
@@ -291,6 +297,7 @@ void handleServo(int direction, float amount, float speed) {
         case DIR_UP:
         case DIR_DOWN:
             tiltServo.write(angle);
+            tiltServo2.write(180 - angle);  // mirror: opposite servo travels inverse angle
             break;
 
         case DIR_LEFT:
@@ -484,6 +491,8 @@ void setup() {
 
     tiltServo.attach(PIN_TILT);
     tiltServo.write(90);
+    tiltServo2.attach(PIN_TILT2);
+    tiltServo2.write(90);   // 180 - 90 = 90 — mirror of centre is still centre
 
     Serial.begin(BAUD_RATE);
     unsigned long lastSent = 0;

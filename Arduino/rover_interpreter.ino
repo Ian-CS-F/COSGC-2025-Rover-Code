@@ -139,8 +139,8 @@ void encoderISR_Left() {
 }
 
 void encoderISR_Right() {
-    if (digitalRead(ENCODER_B_RIGHT)) encoderCountRight++;
-    else                               encoderCountRight--;
+    if (digitalRead(ENCODER_B_RIGHT)) encoderCountRight--;
+    else                               encoderCountRight++;
 }
 
 // ── Servo ─────────────────────────────────────────────────────────────────────

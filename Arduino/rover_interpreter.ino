@@ -143,8 +143,13 @@ void encoderISR_Right() {
     else                               encoderCountRight++;
 }
 
-// ── Servo ─────────────────────────────────────────────────────────────────────
+// ── Servo / pan state ────────────────────────────────────────────────────────
 Servo tiltServo;
+
+// Current pan angle in degrees (90 = centre / facing forward).
+// Updated every time handleServo moves the rover so incremental pan commands
+// only turn the delta rather than always starting from 90°.
+float panAngleDeg = 90.0f;
 
 bool parsePacket(const String& raw, Command& cmd) {
     int start = raw.indexOf('(');
@@ -264,13 +269,57 @@ void sweep(float range, int stepMs) {
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
-void handleServo(int direction, float amount, float /*speed*/) {
+
+/*
+ * handleServo — tilt and pan
+ *
+ * Tilt (DIR_UP / DIR_DOWN):
+ *   Controls the physical tilt servo.
+ *   amount 0.0 → 0°, 0.5 → 90° (level), 1.0 → 180°
+ *
+ * Pan (DIR_LEFT / DIR_RIGHT):
+ *   No pan servo is fitted.  Panning is achieved by tank-turning the rover.
+ *   amount 0.0 → 0° (full left), 0.5 → 90° (centre), 1.0 → 180° (full right)
+ *   The function tracks panAngleDeg so only the delta from the current angle
+ *   is driven — repeated calls behave like a real servo with memory.
+ *   speed field sets motor PWM (0.0–1.0); falls back to SWEEP_TURN_PWM if 0.
+ */
+void handleServo(int direction, float amount, float speed) {
     int angle = constrain((int)(amount * 180.0f), 0, 180);
+
     switch (direction) {
         case DIR_UP:
         case DIR_DOWN:
             tiltServo.write(angle);
             break;
+
+        case DIR_LEFT:
+        case DIR_RIGHT: {
+            float targetDeg = (float)angle;
+            float deltaDeg  = targetDeg - panAngleDeg;
+
+            if (abs(deltaDeg) < 0.5f) break;   // already there — skip tiny moves
+
+            int turnPwm = (speed > 0.01f)
+                          ? constrain((int)(speed * 255.0f), 0, 255)
+                          : SWEEP_TURN_PWM;
+
+            if (deltaDeg > 0.0f) {
+                // Positive delta → turn right (clockwise)
+                setMotor(PIN_ENA, PIN_IN1, PIN_IN2, turnPwm, true);
+                setMotor(PIN_ENB, PIN_IN3, PIN_IN4, turnPwm, false);
+            } else {
+                // Negative delta → turn left (counter-clockwise)
+                setMotor(PIN_ENA, PIN_IN1, PIN_IN2, turnPwm, false);
+                setMotor(PIN_ENB, PIN_IN3, PIN_IN4, turnPwm, true);
+            }
+
+            delay((int)(abs(deltaDeg) * MS_PER_DEGREE));
+            stopMotors();
+
+            panAngleDeg = targetDeg;
+            break;
+        }
     }
 }
 

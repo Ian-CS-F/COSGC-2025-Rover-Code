@@ -1,29 +1,40 @@
 """
 Test Protocol: Servos
 =====================
-Exercises the pan and tilt servos through their full range of motion and
-verifies the SWEEP protocol (both servos coordinated with LIDAR stepping).
+Exercises the tilt servo and motor-based pan through their full range of
+motion, and verifies the SWEEP protocol.
 
-Servo command format (from main.py communication schema):
-    (0, <direction>, <amount>, 0.000)
+Hardware configuration:
+    Tilt axis — single physical servo on PIN_TILT (pin 12).
+                Controlled via SERVO command with direction UP or DOWN.
+    Pan axis  — no pan servo fitted.  Panning rotates the WHOLE ROVER using
+                a motor tank-turn.  The Arduino tracks the current pan angle
+                and only drives the delta on each command.
+
+Servo command format:
+    (0, <direction>, <amount>, <speed>)
     System  = 0  (SERVO)
     Direction:
-        LEFT  (0) = pan servo    — horizontal rotation
-        RIGHT (1) = pan servo    — same servo, direction encoded in amount
-        UP    (2) = tilt servo   — vertical rotation
-        DOWN  (3) = tilt servo   — same servo, direction encoded in amount
-    Amount = target position 0.0–1.0  (maps to 0°–180° in the Arduino)
-    Speed  = unused for servos (always send 0.0)
+        LEFT  (0) / RIGHT (1) = pan  — tank-turns the rover
+        UP    (2) / DOWN  (3) = tilt — moves the physical tilt servo
+    Amount = target angle 0.0–1.0  (→ 0°–180°)
+               0.0 = full left / full down
+               0.5 = centre (90°)
+               1.0 = full right / full up
+    Speed  = motor PWM for pan turns (0.0–1.0); ignored for tilt
 
 The Arduino sends no response to SERVO commands.  Tests verify:
   1. The Arduino stays responsive (QUERY returns DIST:) after each command.
   2. Physical movement is confirmed interactively by the operator.
+
+PAN TESTS ROTATE THE ROVER — ensure the rover has clear space on all sides.
 
 SWEEP protocol:
     Pi sends   (2, 0, <range_deg>, <step_ms>)
     Arduino replies  AT:<h_angle>,<tilt_angle>  at each position
     Pi replies       NEXT                        to step to the next position
     Arduino sends    SWEEP_DONE                  when back at centre
+    (The sweep uses the same motor tank-turn for horizontal steps.)
 
 Requires: Arduino connected on SERIAL_PORT, running rover_interpreter.ino.
 No I2C sensors are needed for servo or sweep tests.
@@ -120,11 +131,11 @@ def _home(ser: serial.Serial) -> None:
 
 def test_pan_centre(ser: serial.Serial) -> bool:
     """
-    Pan servo → 90° (amount=0.5).
-    The turret should be pointing straight ahead.
-    Arduino must remain responsive after the command.
+    Pan → 90° (amount=0.5) — rover faces straight ahead.
+    Uses motor tank-turn; rover rotates to centre from current pan angle.
+    Arduino must remain responsive after the turn completes.
     """
-    print("TEST: Pan → centre (90°)…")
+    print("TEST: Pan → centre (90°) — rover turns to face forward…")
     send_servo(ser, PAN_DIR, 0.5)
     time.sleep(DWELL_S)
     passed = _arduino_alive(ser)
@@ -134,10 +145,10 @@ def test_pan_centre(ser: serial.Serial) -> bool:
 
 def test_pan_full_left(ser: serial.Serial) -> bool:
     """
-    Pan servo → 0° (amount=0.0) — hard left limit.
-    Watch the turret rotate to the left end-stop.
+    Pan → 0° (amount=0.0) — rover rotates 90° left of centre.
+    The rover physically turns left; ensure clear space on the left side.
     """
-    print("TEST: Pan → full left (0°)…")
+    print("TEST: Pan → full left (0°) — rover rotates left 90° from centre…")
     send_servo(ser, PAN_DIR, 0.0)
     time.sleep(DWELL_S)
     passed = _arduino_alive(ser)
@@ -147,10 +158,10 @@ def test_pan_full_left(ser: serial.Serial) -> bool:
 
 def test_pan_full_right(ser: serial.Serial) -> bool:
     """
-    Pan servo → 180° (amount=1.0) — hard right limit.
-    Watch the turret rotate to the right end-stop.
+    Pan → 180° (amount=1.0) — rover rotates 90° right of centre.
+    The rover physically turns right; ensure clear space on the right side.
     """
-    print("TEST: Pan → full right (180°)…")
+    print("TEST: Pan → full right (180°) — rover rotates right 180° from 0°…")
     send_servo(ser, PAN_DIR, 1.0)
     time.sleep(DWELL_S)
     passed = _arduino_alive(ser)
@@ -160,11 +171,12 @@ def test_pan_full_right(ser: serial.Serial) -> bool:
 
 def test_pan_sweep_manual(ser: serial.Serial) -> bool:
     """
-    Step the pan servo through 0° → 180° → 90° in 10% increments.
+    Step the pan through 0° → 180° → 90° in 10% increments via motor turns.
+    The rover physically rotates at each step — ensure 180° of clear space.
     Verifies the Arduino accepts every command and stays alive throughout.
-    Operator should see smooth continuous rotation.
     """
     print(f"TEST: Pan stepped sweep 0°→180°→90° ({len(STEP_POSITIONS)*2 - 1} steps)…")
+    print("  NOTE: rover will physically rotate — ensure clear space around it.")
     all_ok = True
     for pos in STEP_POSITIONS + list(reversed(STEP_POSITIONS[:-1])) + [CENTRE]:
         send_servo(ser, PAN_DIR, pos)
@@ -508,8 +520,8 @@ def _visual_check(ser: serial.Serial) -> None:
     Useful for checking physical endpoints and finding any binding.
     """
     print("\n── Interactive servo check ─────────────────────────────")
-    print("  Enter angle 0–180 for pan servo, 'tilt <angle>' for tilt,")
-    print("  or 'q' to continue.\n")
+    print("  Enter angle 0–180 to pan (rover rotates via motors), 'tilt <angle>' for tilt.")
+    print("  Pan 90 = face forward.  Ensure clear space.  'q' to continue.\n")
     while True:
         try:
             raw = input("  angle> ").strip().lower()
@@ -562,8 +574,8 @@ if __name__ == "__main__":
     results: list[tuple[str, bool]] = []
 
     # ── Section 1: Pan axis ───────────────────────────────────────────────────
-    print("\n=== PAN SERVO (horizontal) ===")
-    print("Watch the turret rotate left/right.\n")
+    print("\n=== PAN (motor tank-turn) ===")
+    print("The rover physically rotates — ensure 180° of clear space around it.\n")
     for fn in [
         test_pan_centre,
         test_pan_full_left,

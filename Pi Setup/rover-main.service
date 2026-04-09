@@ -1,0 +1,16 @@
+[Unit]
+Description=COSGC Rover main.py
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/cosgc_26_rover/COSGC-2025-Rover-Code/Python/main.py
+WorkingDirectory=/home/cosgc_26_rover/COSGC-2025-Rover-Code/Python
+Restart=on-failure
+RestartSec=5
+User=cosgc_26_rover
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

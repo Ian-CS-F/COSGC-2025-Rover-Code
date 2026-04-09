@@ -318,6 +318,11 @@ void handleServo(int direction, float amount, float speed) {
             stopMotors();
 
             panAngleDeg = targetDeg;
+
+            // Notify the Pi so it can read the IMU and compare actual vs expected.
+            // Positive delta = turned right, negative = turned left.
+            Serial.print("PAN_DONE:");
+            Serial.println(deltaDeg, 2);
             break;
         }
     }

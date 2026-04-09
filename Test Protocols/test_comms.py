@@ -185,9 +185,13 @@ def test_query_sequential(ser):
 
 # ── Section 4: SERVO (system 0) ───────────────────────────────────────────────
 def test_servo_centre(ser):
-    """SERVO to 0.5 (90°) — no crash, Arduino remains responsive."""
-    print("TEST: SERVO 0.5 (90°) — no response expected, Arduino stays alive...")
-    send_command(ser, SERVO, UP, 0.5, 0.0)   # direction=UP, amount=0.5 → 90°
+    """TILT servo to 0.5 (90°) — no crash, Arduino remains responsive.
+
+    Uses direction=UP (tilt axis only).  There is no pan servo; horizontal
+    panning is done by motor tank-turns and is not tested here.
+    """
+    print("TEST: SERVO UP 0.5 (tilt 90°) — no response expected, Arduino stays alive...")
+    send_command(ser, SERVO, UP, 0.5, 0.0)   # direction=UP, amount=0.5 → 90° tilt
     time.sleep(0.3)
     send_command(ser, QUERY, 0, 0.0, 0.0)
     resp = wait_for(ser, "DIST:", timeout=3.0)
@@ -196,8 +200,12 @@ def test_servo_centre(ser):
     return passed
 
 def test_servo_full_range(ser):
-    """SERVO sweeps from 0.0 (0°) to 1.0 (180°) and back — Arduino stays alive."""
-    print("TEST: SERVO 0.0→1.0→0.5 (0°→180°→90°) — Arduino stays alive...")
+    """TILT servo sweeps 0.0→1.0→0.5 (0°→180°→90°) — Arduino stays alive.
+
+    Uses direction=UP (tilt axis only).  There is no pan servo; horizontal
+    panning is done by motor tank-turns and is not tested here.
+    """
+    print("TEST: SERVO UP 0.0→1.0→0.5 (tilt 0°→180°→90°) — Arduino stays alive...")
     for amount in (0.0, 1.0, 0.5):
         send_command(ser, SERVO, UP, amount, 0.0)
         time.sleep(0.3)

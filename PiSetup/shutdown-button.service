@@ -5,7 +5,7 @@ After=multi-user.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /home/cosgc_26_rover/COSGC-2025-Rover-Code/Pi\ Setup/shutdown_button.py
+ExecStart=/usr/bin/python3 "/home/cosgc_26_rover/COSGC-2025-Rover-Code/PiSetup/shutdown_button.py"
 Restart=on-failure
 RestartSec=5
 User=root

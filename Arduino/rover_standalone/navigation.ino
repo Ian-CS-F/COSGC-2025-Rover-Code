@@ -42,11 +42,8 @@
 #define NAV_MIN_CLEAR_CM  15.0f   // reading below this = zone blocked
 #define NAV_CENTER_BIAS   20.0f   // score bonus added to center zone
 
-// ── Direction constants ───────────────────────────────────────────────────────
-#define NAV_CENTER  0
-#define NAV_LEFT    1
-#define NAV_RIGHT   2
-#define NAV_BACK    3   // all zones blocked — caller should turn 180°
+// ── Direction constants defined in rover_standalone.ino ──────────────────────
+// NAV_CENTER=0, NAV_LEFT=1, NAV_RIGHT=2, NAV_BACK=3
 
 // ── Zone state ────────────────────────────────────────────────────────────────
 struct ZoneScore {

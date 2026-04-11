@@ -45,6 +45,12 @@
  * IMU register details are in imu.ino.
  */
 
+// ── Navigation direction constants (used here and in navigation.ino) ──────────
+#define NAV_CENTER  0
+#define NAV_LEFT    1
+#define NAV_RIGHT   2
+#define NAV_BACK    3
+
 // ── Drive configuration ───────────────────────────────────────────────────────
 #define SEGMENT_CM           30.0f
 #define DRIVE_SPEED           0.65f  // >0.6 needed for reliable motor operation

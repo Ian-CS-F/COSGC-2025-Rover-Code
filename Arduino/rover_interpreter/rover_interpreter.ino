@@ -53,6 +53,17 @@
  *   Motors run continuously until the next command (no DONE sent).
  *   Intended for direct/teleoperation use.
  *
+ * Straight protocol (encoder-based heading hold):
+ *   Pi sends      (6, <dir>, <distance_cm>, <speed>)
+ *   Direction: UP (forward) or DOWN (reverse)
+ *   Arduino drives the requested distance while continuously comparing left
+ *   and right encoder counts.  A P-controller adjusts each side's PWM to
+ *   keep both sides equal, compensating for motor imbalance and drift.
+ *   Arduino sends "DONE:<left_cm>,<right_cm>,<left_ratio>,<right_ratio>"
+ *   when complete (same format as MOTOR DONE).
+ *   CLIFF detection works identically to MOTOR protocol.
+ *   Tune STRAIGHT_KP if the rover still drifts (higher = more aggressive).
+ *
  * Handshake:
  *   Arduino sends  "READY"  every second until Pi replies "ACK"
  *
@@ -95,12 +106,13 @@
 
 #define MIDDLE_ANGLE 90
 
-#define SYS_SERVO 0
-#define SYS_MOTOR 1
-#define SYS_SWEEP 2
-#define SYS_QUERY 3
-#define SYS_FLIP  4
-#define SYS_DRIVE 5  // independent per-side speed control
+#define SYS_SERVO    0
+#define SYS_MOTOR    1
+#define SYS_SWEEP    2
+#define SYS_QUERY    3
+#define SYS_FLIP     4
+#define SYS_DRIVE    5  // independent per-side speed control
+#define SYS_STRAIGHT 6  // encoder-differential heading hold (see rover_control.ino)
 
 #define COUNTS_PER_REV   64     // 64 P/R, 1x decoding (rising edge on A only)
 #define DIST_PER_REV_CM  35.2f  // cm per full encoder revolution — calibrate!
@@ -460,12 +472,13 @@ void handleDrive(float leftSpeed, float rightSpeed) {
 
 void dispatch(const Command& cmd) {
     switch (cmd.system) {
-        case SYS_SERVO: handleServo(cmd.direction, cmd.amount, cmd.speed); break;
-        case SYS_MOTOR: handleMotor(cmd.direction, cmd.amount, cmd.speed); break;
-        case SYS_SWEEP: handleSweep(cmd.amount, cmd.speed);                break;
-        case SYS_QUERY: handleQuery();                                      break;
-        case SYS_FLIP:  handleFlip(cmd.amount);                            break;
-        case SYS_DRIVE: handleDrive(cmd.amount, cmd.speed);                break;
+        case SYS_SERVO:    handleServo(cmd.direction, cmd.amount, cmd.speed);            break;
+        case SYS_MOTOR:    handleMotor(cmd.direction, cmd.amount, cmd.speed);            break;
+        case SYS_SWEEP:    handleSweep(cmd.amount, cmd.speed);                           break;
+        case SYS_QUERY:    handleQuery();                                                 break;
+        case SYS_FLIP:     handleFlip(cmd.amount);                                       break;
+        case SYS_DRIVE:    handleDrive(cmd.amount, cmd.speed);                           break;
+        case SYS_STRAIGHT: handleStraight(cmd.direction, cmd.amount, cmd.speed);        break;
     }
 }
 

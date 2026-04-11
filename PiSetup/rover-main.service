@@ -1,13 +1,16 @@
 [Unit]
 Description=COSGC Rover main.py
-After=multi-user.target
+After=multi-user.target dev-ttyACM0.device
+Requires=dev-ttyACM0.device
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 /home/cosgc_26_rover/COSGC-2025-Rover-Code/Python/main.py
 WorkingDirectory=/home/cosgc_26_rover/COSGC-2025-Rover-Code/Python
 Restart=on-failure
-RestartSec=5
+RestartSec=10
+StartLimitIntervalSec=60
+StartLimitBurst=3
 User=cosgc_26_rover
 StandardOutput=journal
 StandardError=journal

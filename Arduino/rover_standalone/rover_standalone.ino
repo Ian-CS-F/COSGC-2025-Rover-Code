@@ -1,70 +1,71 @@
 #include <Arduino.h>
 #include <Servo.h>
+// Wire.h included by imu.ino, math.h included by heightmap.ino
 
 /*
  * rover_standalone.ino
  * ====================
  * Autonomous rover operation WITHOUT a Raspberry Pi.
- * Upload this sketch when the Pi is unavailable.
+ * Upload rover_standalone/ when the Pi is unavailable.
  *
- * Single HC-SR04 ultrasonic mounted on the tilt servo bracket.
- * The servo aims it forward for obstacle detection, then down for
- * cliff detection, before each drive segment.
+ * Companion files (compiled together automatically):
+ *   imu.ino        — ICM-20948 gyro heading integration
+ *   heightmap.ino  — ultrasonic tilt-sweep heightmap and obstacle/cliff detection
  *
  * Behaviour loop:
- *   1. Tilt forward → read ultrasonic
- *      - Obstacle within OBSTACLE_THRESHOLD_CM → turn AVOID_TURN_DEG and retry
- *   2. Tilt down → read ultrasonic
- *      - Ground too far (> CLIFF_THRESHOLD_CM) → stop permanently
- *   3. Drive SEGMENT_CM straight with encoder heading hold
- *   4. Repeat
+ *   1. Sweep tilt servo → build ultrasonic heightmap
+ *   2. Obstacle detected in heightmap → tank-turn AVOID_TURN_DEG, retry (max 6 times)
+ *   3. Cliff detected in heightmap → halt permanently
+ *   4. Drive SEGMENT_CM with IMU gyro heading hold (encoder fallback if IMU absent)
+ *   5. Repeat
+ *
+ * ── Wiring ───────────────────────────────────────────────────────────────────
+ *   Left motor    : L298N A  ENA=4, IN1=6, IN2=7
+ *   Right motor   : L298N B  ENB=5, IN3=8, IN4=9
+ *   Tilt servo 1  : pin 12
+ *   Tilt servo 2  : pin 13  (mirror-mounted — commanded 180−angle)
+ *   Ultrasonic    : TRIG=A0, ECHO=A1  (on tilt servo bracket)
+ *   Left encoder  : A=pin2 (INT0), B=pin10
+ *   Right encoder : A=pin3 (INT1), B=pin11
+ *   ICM-20948 IMU : SDA=pin20, SCL=pin21, VCC=3.3V, AD0=3.3V (addr 0x69)
+ *                   Use a level shifter if your breakout has no onboard one.
  *
  * ── Tuning ───────────────────────────────────────────────────────────────────
- * SEGMENT_CM            distance driven per check cycle (cm)
+ * SEGMENT_CM            distance driven per check cycle
  * DRIVE_SPEED           motor speed 0.0–1.0
- * START_DELAY_MS        countdown before moving (ms) — time to place rover
- * TILT_FORWARD_DEG      servo angle for forward-facing scan (obstacle)
- * TILT_CLIFF_DEG        servo angle for downward-facing scan (cliff)
- *                         increase if ultrasonic doesn't see the floor
- * TILT_SETTLE_MS        wait after moving servo before reading (ms)
- * OBSTACLE_THRESHOLD_CM stop and turn if obstacle closer than this (cm)
- * CLIFF_THRESHOLD_CM    stop if floor further than this (cm)
- * AVOID_TURN_DEG        degrees to tank-turn when obstacle detected
- * STRAIGHT_KP           P-gain for heading hold; raise if drifts, lower if oscillates
+ * START_DELAY_MS        countdown before moving (seconds to place rover)
+ * AVOID_TURN_DEG        degrees to tank-turn when blocked
+ * MAX_AVOID_ATTEMPTS    give up and halt after this many turns in a row
+ * IMU_KP                heading correction gain (IMU) — raise if drifts
+ * ENCODER_KP            heading correction gain (encoder fallback)
+ * MAX_CORRECTION        max PWM trim per side (0–255)
+ * MS_PER_DEGREE         ms per degree of tank turn — calibrate on your rover
  *
- * Hardware: Arduino Mega 2560
- *   Left motor   : L298N A  (ENA=4, IN1=6, IN2=7)
- *   Right motor  : L298N B  (ENB=5, IN3=8, IN4=9)
- *   Tilt servo 1 : pin 12
- *   Tilt servo 2 : pin 13  (mirror-mounted — always commanded 180-angle)
- *   Ultrasonic   : TRIG=A0, ECHO=A1  (mounted on servo bracket)
- *   Left encoder : A=pin2 (INT0), B=pin10
- *   Right encoder: A=pin3 (INT1), B=pin11
+ * Heightmap tuning is in heightmap.ino.
+ * IMU register details are in imu.ino.
  */
 
-// ── Course / behaviour configuration ─────────────────────────────────────────
-#define SEGMENT_CM              30.0f   // drive this far between sensor checks
-#define DRIVE_SPEED              0.55f
-#define START_DELAY_MS           3000
-
-// ── Servo / sensor angles ─────────────────────────────────────────────────────
-#define TILT_FORWARD_DEG         90     // level — looks straight ahead
-#define TILT_CLIFF_DEG          140     // angled down — looks at ground ahead
-#define TILT_SETTLE_MS          300     // ms to wait after moving servo
-
-// ── Detection thresholds ──────────────────────────────────────────────────────
-#define OBSTACLE_THRESHOLD_CM    50.0f  // obstacle if reading < this
-#define CLIFF_THRESHOLD_CM       40.0f  // cliff if reading > this
+// ── Drive configuration ───────────────────────────────────────────────────────
+#define SEGMENT_CM           30.0f
+#define DRIVE_SPEED           0.65f  // >0.6 needed for reliable motor operation
+#define START_DELAY_MS        3000
 
 // ── Obstacle avoidance ────────────────────────────────────────────────────────
-#define AVOID_TURN_DEG           30.0f  // degrees to turn when blocked
-#define AVOID_TURN_PWM           150    // motor PWM during turn
-#define MS_PER_DEGREE            12     // ms per degree of tank turn — calibrate!
-#define MAX_AVOID_ATTEMPTS        6     // give up after this many turns in a row
+// OBSTACLE_THRESHOLD_CM is also used by heightmap.ino (compiled together)
+#define OBSTACLE_THRESHOLD_CM 60.0f   // stop and avoid if obstacle closer than this
+#define AVOID_TURN_DEG        30.0f
+#define AVOID_TURN_PWM        170     // >0.6 of 255 — matches minimum reliable speed
+#define MS_PER_DEGREE         12      // ms per degree of tank turn — calibrate!
 
-// ── Heading hold tuning ───────────────────────────────────────────────────────
-#define STRAIGHT_KP              4.0f
-#define STRAIGHT_MAX_CORRECTION  60
+// ── Cliff detection ───────────────────────────────────────────────────────────
+#define CLIFF_TILT_DEG        140     // servo angle for downward cliff check
+#define CLIFF_TILT_SETTLE_MS  300     // ms to wait for servo to reach angle
+#define CLIFF_THRESHOLD_CM    40.0f   // ultrasonic: floor missing if reading > this
+
+// ── Heading hold ──────────────────────────────────────────────────────────────
+#define IMU_KP               8.0f    // gain when IMU available
+#define ENCODER_KP           4.0f    // gain when falling back to encoders
+#define MAX_CORRECTION       60      // max PWM trim per side
 
 // ── Pin definitions ───────────────────────────────────────────────────────────
 #define PIN_ENA  4
@@ -111,7 +112,7 @@ Servo tiltServo2;
 void setTilt(int angle) {
     angle = constrain(angle, 0, 180);
     tiltServo.write(angle);
-    tiltServo2.write(180 - angle);  // mirror-mounted
+    tiltServo2.write(180 - angle);
 }
 
 // ── Motor helpers ─────────────────────────────────────────────────────────────
@@ -137,33 +138,27 @@ float readUltrasonic() {
     return (us == 0) ? 999.0f : us * 0.01715f;
 }
 
-// Read ultrasonic at a given tilt angle (moves servo, waits, reads, leaves servo there)
-float readAt(int tiltDeg) {
-    setTilt(tiltDeg);
-    delay(TILT_SETTLE_MS);
-    return readUltrasonic();
-}
-
 // ── Tank turns ────────────────────────────────────────────────────────────────
 void turnRight(float degrees) {
-    int ms = (int)(degrees * MS_PER_DEGREE);
     setMotor(PIN_ENA, PIN_IN1, PIN_IN2, AVOID_TURN_PWM, true);
     setMotor(PIN_ENB, PIN_IN3, PIN_IN4, AVOID_TURN_PWM, false);
-    delay(ms);
+    delay((int)(degrees * MS_PER_DEGREE));
     stopMotors();
 }
 
 void turnLeft(float degrees) {
-    int ms = (int)(degrees * MS_PER_DEGREE);
     setMotor(PIN_ENA, PIN_IN1, PIN_IN2, AVOID_TURN_PWM, false);
     setMotor(PIN_ENB, PIN_IN3, PIN_IN4, AVOID_TURN_PWM, true);
-    delay(ms);
+    delay((int)(degrees * MS_PER_DEGREE));
     stopMotors();
 }
 
-// ── Straight drive with encoder heading hold ──────────────────────────────────
-// Returns true = target reached, false = timed out
-bool driveStraight(float distanceCm, float speed) {
+// ── Straight drive with heading hold ──────────────────────────────────────────
+// Uses IMU gyro if available, encoder differential as fallback.
+// imuAvailable is set in setup() after imuBegin().
+static bool imuAvailable = false;
+
+void driveStraight(float distanceCm, float speed) {
     int  basePwm      = constrain((int)(speed * 255.0f), 0, 255);
     long targetCounts = (long)(distanceCm / DIST_PER_REV_CM * COUNTS_PER_REV);
 
@@ -172,6 +167,7 @@ bool driveStraight(float distanceCm, float speed) {
     long startRight = encoderCountRight;
     interrupts();
 
+    imuResetHeading();
     unsigned long deadline = millis() + MOTOR_TIMEOUT_MS;
 
     setMotor(PIN_ENA, PIN_IN1, PIN_IN2, basePwm, true);
@@ -185,21 +181,33 @@ bool driveStraight(float distanceCm, float speed) {
 
         if (absL >= targetCounts || absR >= targetCounts) break;
 
-        long diff       = absL - absR;
-        int  correction = constrain((int)(STRAIGHT_KP * diff),
-                                    -STRAIGHT_MAX_CORRECTION,
-                                     STRAIGHT_MAX_CORRECTION);
+        imuUpdate();
 
+        int correction;
+        if (imuAvailable) {
+            // IMU: positive heading = drifted right → slow right, speed left
+            correction = constrain((int)(IMU_KP * imuHeadingDeg()),
+                                   -MAX_CORRECTION, MAX_CORRECTION);
+        } else {
+            // Encoder fallback: positive diff = left ahead → need to slow left.
+            // Negate so that positive diff → negative correction → left slows.
+            long diff  = absL - absR;
+            correction = constrain((int)(-ENCODER_KP * diff),
+                                   -MAX_CORRECTION, MAX_CORRECTION);
+        }
+
+        // Positive correction → left motor faster, right slower (turns right).
+        // IMU:     +heading = turned right → correction positive → speeds left back ✓
+        // Encoder: left ahead → correction negative → slows left ✓
         setMotor(PIN_ENA, PIN_IN1, PIN_IN2,
-                 constrain(basePwm - correction, 0, 255), true);
-        setMotor(PIN_ENB, PIN_IN3, PIN_IN4,
                  constrain(basePwm + correction, 0, 255), true);
+        setMotor(PIN_ENB, PIN_IN3, PIN_IN4,
+                 constrain(basePwm - correction, 0, 255), true);
 
         delay(10);
     }
 
     stopMotors();
-    return true;
 }
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
@@ -223,7 +231,13 @@ void setup() {
 
     tiltServo.attach(PIN_TILT);
     tiltServo2.attach(PIN_TILT2);
-    setTilt(TILT_FORWARD_DEG);
+    setTilt(90);
+
+    imuAvailable = imuBegin();
+    if (!imuAvailable) {
+        Serial.println("IMU not found — using encoder heading hold as fallback.");
+    }
+
 
     Serial.print("STANDALONE: starting in ");
     Serial.print(START_DELAY_MS / 1000);
@@ -234,47 +248,46 @@ void setup() {
 
 // ── Main loop ─────────────────────────────────────────────────────────────────
 void loop() {
-    // ── 1. Obstacle check (servo forward) ─────────────────────────────────────
-    int avoidAttempts = 0;
-    while (avoidAttempts < MAX_AVOID_ATTEMPTS) {
-        float forwardDist = readAt(TILT_FORWARD_DEG);
-        Serial.print("OBSTACLE CHECK: ");
-        Serial.print(forwardDist);
-        Serial.println(" cm");
+    // ── 1. Heightmap sweep (populates data used by chooseDirection) ───────────
+    hmScan();
+    hmPrint();
 
-        if (forwardDist >= OBSTACLE_THRESHOLD_CM) break;  // clear
+    // ── 2. Zone-based navigation decision ─────────────────────────────────────
+    int dir = chooseDirection();
 
-        // Blocked — turn right and try again
-        Serial.print("OBSTACLE: turning right ");
-        Serial.print(AVOID_TURN_DEG);
-        Serial.println(" deg");
-        turnRight(AVOID_TURN_DEG);
+    if (dir == NAV_BACK) {
+        Serial.println("STANDALONE: all zones blocked — reversing 180°.");
+        turnRight(180.0f);
         delay(200);
-        avoidAttempts++;
+        return;  // rescan immediately after turning
     }
 
-    if (avoidAttempts >= MAX_AVOID_ATTEMPTS) {
-        Serial.println("STANDALONE: stuck — cannot find clear path. Stopped.");
-        while (true) {}  // halt
+    if (dir == NAV_LEFT) {
+        Serial.print("STANDALONE: turning left ");
+        Serial.print(AVOID_TURN_DEG); Serial.println("°");
+        turnLeft(AVOID_TURN_DEG);
+    } else if (dir == NAV_RIGHT) {
+        Serial.print("STANDALONE: turning right ");
+        Serial.print(AVOID_TURN_DEG); Serial.println("°");
+        turnRight(AVOID_TURN_DEG);
     }
+    // NAV_CENTER: no turn needed
 
-    // ── 2. Cliff check (servo down) ───────────────────────────────────────────
-    float groundDist = readAt(TILT_CLIFF_DEG);
-    Serial.print("CLIFF CHECK: ");
-    Serial.print(groundDist);
-    Serial.println(" cm");
+    // ── 3. Cliff check before driving ─────────────────────────────────────────
+    // Tilt down, read ultrasonic, tilt back to level
+    setTilt(CLIFF_TILT_DEG);
+    delay(CLIFF_TILT_SETTLE_MS);
+    float groundDist = readUltrasonic();
+    setTilt(90);
+    Serial.print("CLIFF: "); Serial.print(groundDist); Serial.println(" cm");
 
     if (groundDist > CLIFF_THRESHOLD_CM) {
-        Serial.println("STANDALONE: cliff detected — stopped.");
-        setTilt(TILT_FORWARD_DEG);
-        while (true) {}  // halt
+        Serial.println("STANDALONE: cliff detected — halted.");
+        while (true) {}
     }
 
-    // ── 3. Drive one segment ──────────────────────────────────────────────────
-    setTilt(TILT_FORWARD_DEG);  // return to forward while driving
-    Serial.print("STANDALONE: driving ");
-    Serial.print(SEGMENT_CM);
-    Serial.println(" cm");
+    // ── 4. Drive one segment with heading hold ────────────────────────────────
+    Serial.print("STANDALONE: driving "); Serial.print(SEGMENT_CM); Serial.println(" cm");
     driveStraight(SEGMENT_CM, DRIVE_SPEED);
-    delay(100);  // brief pause before next check
+    delay(100);
 }

@@ -59,8 +59,13 @@ static ZoneScore _zones[3];   // [NAV_CENTER, NAV_LEFT, NAV_RIGHT]
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-// Point tilt servo level and take one ultrasonic reading.
+// Point tilt servo level and take one distance reading.
+// Uses LIDAR if available (faster, more accurate), ultrasonic otherwise.
+// lidarAvailable is defined in rover_standalone.ino (compiled together).
 static float _quickRead() {
+    if (lidarAvailable) {
+        return lidarForwardCm();   // LIDAR: no servo move needed, instant read
+    }
     setTilt(NAV_SCAN_TILT);
     delay(NAV_TILT_SETTLE);
     return readUltrasonic();

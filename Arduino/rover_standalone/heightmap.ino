@@ -40,7 +40,7 @@
 // ── Heightmap tuning ──────────────────────────────────────────────────────────
 #define SENSOR_HEIGHT_CM   20.0f   // height of ultrasonic above ground — MEASURE THIS
 
-#define SCAN_TILT_MIN      60      // servo degrees — upward extreme (tall obstacle detection)
+#define SCAN_TILT_MIN      90      // servo degrees — upward extreme (tall obstacle detection)
 #define SCAN_TILT_MAX      140     // servo degrees — downward extreme (cliff detection)
                                    // 90° = horizontal, >90° = below horizontal
 #define SCAN_STEPS         10      // samples across sweep

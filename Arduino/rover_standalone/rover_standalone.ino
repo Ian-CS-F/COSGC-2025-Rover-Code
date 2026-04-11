@@ -156,7 +156,8 @@ void turnLeft(float degrees) {
 // ── Straight drive with heading hold ──────────────────────────────────────────
 // Uses IMU gyro if available, encoder differential as fallback.
 // imuAvailable is set in setup() after imuBegin().
-static bool imuAvailable = false;
+static bool imuAvailable   = false;
+static bool lidarAvailable = false;
 
 void driveStraight(float distanceCm, float speed) {
     int  basePwm      = constrain((int)(speed * 255.0f), 0, 255);
@@ -238,6 +239,10 @@ void setup() {
         Serial.println("IMU not found — using encoder heading hold as fallback.");
     }
 
+    lidarAvailable = lidarBegin();
+    if (!lidarAvailable) {
+        Serial.println("LIDAR not found — using heightmap for obstacle detection.");
+    }
 
     Serial.print("STANDALONE: starting in ");
     Serial.print(START_DELAY_MS / 1000);

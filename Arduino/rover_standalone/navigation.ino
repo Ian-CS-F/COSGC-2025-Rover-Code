@@ -34,6 +34,8 @@
  *   NAV_CENTER_BIAS   score bonus for center zone (prefer straight)
  */
 
+#include "config.h"
+
 // ── Tuning ────────────────────────────────────────────────────────────────────
 #define NAV_SCAN_ANGLE    30      // degrees to turn for left/right zone reads
 #define NAV_SCAN_TILT     90      // servo angle for horizontal read (level)

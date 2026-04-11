@@ -36,19 +36,9 @@
  */
 
 #include <math.h>
+#include "config.h"
 
-// ── Heightmap tuning ──────────────────────────────────────────────────────────
-#define SENSOR_HEIGHT_CM   20.0f   // height of ultrasonic above ground — MEASURE THIS
-
-#define SCAN_TILT_MIN      90      // servo degrees — upward extreme (tall obstacle detection)
-#define SCAN_TILT_MAX      140     // servo degrees — downward extreme (cliff detection)
-                                   // 90° = horizontal, >90° = below horizontal
-#define SCAN_STEPS         10      // samples across sweep
-#define SCAN_SETTLE_MS     250     // ms to wait after each servo move
-
-#define OBSTACLE_MIN_CM     5.0f   // objects below this height are floor — ignore
-#define OBSTACLE_MAX_CM    60.0f   // objects above this are overhead — ignore
-#define CLIFF_DROP_CM      10.0f   // object height this far below ground = cliff
+// All tuning constants from config.h
 
 // ── Heightmap storage ─────────────────────────────────────────────────────────
 struct HmCell {

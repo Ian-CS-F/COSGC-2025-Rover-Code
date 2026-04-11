@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Servo.h>
+#include "config.h"
 // Wire.h included by imu.ino, math.h included by heightmap.ino
 
 /*
@@ -45,57 +46,7 @@
  * IMU register details are in imu.ino.
  */
 
-// ── Navigation direction constants (used here and in navigation.ino) ──────────
-#define NAV_CENTER  0
-#define NAV_LEFT    1
-#define NAV_RIGHT   2
-#define NAV_BACK    3
-
-// ── Drive configuration ───────────────────────────────────────────────────────
-#define SEGMENT_CM           30.0f
-#define DRIVE_SPEED           0.65f  // >0.6 needed for reliable motor operation
-#define START_DELAY_MS        3000
-
-// ── Obstacle avoidance ────────────────────────────────────────────────────────
-// OBSTACLE_THRESHOLD_CM is also used by heightmap.ino (compiled together)
-#define OBSTACLE_THRESHOLD_CM 60.0f   // stop and avoid if obstacle closer than this
-#define AVOID_TURN_DEG        30.0f
-#define AVOID_TURN_PWM        170     // >0.6 of 255 — matches minimum reliable speed
-#define MS_PER_DEGREE         12      // ms per degree of tank turn — calibrate!
-
-// ── Cliff detection ───────────────────────────────────────────────────────────
-#define CLIFF_TILT_DEG        140     // servo angle for downward cliff check
-#define CLIFF_TILT_SETTLE_MS  300     // ms to wait for servo to reach angle
-#define CLIFF_THRESHOLD_CM    40.0f   // ultrasonic: floor missing if reading > this
-
-// ── Heading hold ──────────────────────────────────────────────────────────────
-#define IMU_KP               8.0f    // gain when IMU available
-#define ENCODER_KP           4.0f    // gain when falling back to encoders
-#define MAX_CORRECTION       60      // max PWM trim per side
-
-// ── Pin definitions ───────────────────────────────────────────────────────────
-#define PIN_ENA  4
-#define PIN_IN1  6
-#define PIN_IN2  7
-#define PIN_ENB  5
-#define PIN_IN3  8
-#define PIN_IN4  9
-
-#define PIN_TILT  12
-#define PIN_TILT2 13
-
-#define PIN_ULTRA_TRIG A0
-#define PIN_ULTRA_ECHO A1
-
-#define ENCODER_A_LEFT  2
-#define ENCODER_B_LEFT  10
-#define ENCODER_A_RIGHT 3
-#define ENCODER_B_RIGHT 11
-
-// ── Constants ─────────────────────────────────────────────────────────────────
-#define COUNTS_PER_REV   64
-#define DIST_PER_REV_CM  35.2f
-#define MOTOR_TIMEOUT_MS 30000UL
+// All constants and pin definitions are in config.h
 
 // ── Encoder state ─────────────────────────────────────────────────────────────
 volatile long encoderCountLeft  = 0;

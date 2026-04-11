@@ -20,6 +20,7 @@
  */
 
 #include <Wire.h>
+#include "config.h"
 
 // ── ICM-20948 register map (minimal — gyro only) ──────────────────────────────
 #define ICM_ADDR       0x69

@@ -20,6 +20,8 @@
  *   float lidarForwardCm()      — best distance reading in cm (primary preferred)
  */
 
+#include "config.h"
+
 // ── LIDAR-Lite v4 registers ───────────────────────────────────────────────────
 #define LIDAR_REG_CMD        0x00
 #define LIDAR_REG_STATUS     0x01   // bit 0: 1=busy, 0=ready
